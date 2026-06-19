@@ -160,7 +160,7 @@ HypoMux 是一个完全出于技术热情、由作者在业余时间独立开发
 > 赞助请留下您的昵称！
 
 <div align="center">
-  <img src="./assets/Support/wechat_pay.png" alt="微信赞赏码" width="220" />
+  <img src="./assets/Support/wechat_pay.png" alt="微信赞赏码" width="300" />
   <br />
   <sub>微信号赞赏（请备注：HypoMux 支持）</sub>
 </div>
