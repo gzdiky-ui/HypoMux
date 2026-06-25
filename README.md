@@ -180,6 +180,12 @@ HypoMux 是一个完全出于技术热情、由作者在业余时间独立开发
   <img src="./assets/Support/1.svg" fill="none" alt="Sponsor Badge" />
 </a> <a href="https://github.com/Hypostasis-Cat/HypoMux"><img src="https://img.shields.io/badge/匿名-☕请喝咖啡-orange?style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
 
+## 📈 Star 历史趋势 / Star History
+
+随着新功能不断解锁，欢迎见证 HypoMux 的成长！
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Hypostasis-Cat/HypoMux&type=Date)](https://star-history.com/#Hypostasis-Cat/HypoMux&Date)
+
 ## 📄 开源协议
 
 本项目基于 **AGPL-3.0** 开源协议。
