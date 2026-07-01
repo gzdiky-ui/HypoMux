@@ -21,9 +21,12 @@ HypoMux 代理后端模块 - v2.0（SOCKS5 + HTTP 双协议无感接管）
 
 import asyncio
 import ctypes
+import ssl
+import random
 import socket
 import struct
 import threading
+import time
 from ctypes import wintypes
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -32,6 +35,47 @@ import psutil
 from PySide6.QtCore import QThread, Signal
 
 from utils.network_utils import get_adapter_if_indices
+
+
+def _is_winerror6_overlapped_cancel(context: dict) -> bool:
+    """识别 Windows Proactor 在停止阶段产生的无效句柄取消噪声。"""
+    message = str(context.get("message", ""))
+    exception = context.get("exception")
+    return (
+        "Cancelling an overlapped future failed" in message
+        and isinstance(exception, OSError)
+        and getattr(exception, "winerror", None) == 6
+    )
+
+
+def _quiet_asyncio_exception_handler(loop, context: dict):
+    """过滤停止阶段的 WinError 6 日志，其余异常仍交给 asyncio 默认处理。"""
+    if _is_winerror6_overlapped_cancel(context):
+        return
+    loop.default_exception_handler(context)
+
+
+def _shutdown_event_loop(loop: asyncio.AbstractEventLoop):
+    """按 Windows Proactor 生命周期要求完整关闭事件循环。"""
+    try:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        pass
+    try:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass
+    shutdown_default_executor = getattr(loop, "shutdown_default_executor", None)
+    if callable(shutdown_default_executor):
+        try:
+            loop.run_until_complete(shutdown_default_executor())
+        except Exception:
+            pass
+    loop.close()
 
 
 # IPv4 下的 IP_UNICAST_IF：强制指定物理网卡出口，绕过 Windows 默认路由判定。
@@ -210,6 +254,7 @@ class ProxyWorker(QThread):
     def run(self):
         """子线程主体：建立独立 asyncio loop 并跑到收到停止信号。"""
         self._loop = asyncio.new_event_loop()
+        self._loop.set_exception_handler(_quiet_asyncio_exception_handler)
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._serve())
@@ -217,7 +262,7 @@ class ProxyWorker(QThread):
             self.error_signal.emit(f"代理内核异常退出: {type(e).__name__}: {e}")
         finally:
             try:
-                self._loop.close()
+                _shutdown_event_loop(self._loop)
             finally:
                 self._loop = None
             self.stopped.emit("代理已停止")
@@ -872,3 +917,828 @@ class ProxyWorker(QThread):
                 last_recv, last_sent = now_recv, now_sent
         except asyncio.CancelledError:
             pass
+
+
+# ==========================================
+# 任务1：多端口多出站池 (MultiPortProxyWorker)
+# ==========================================
+# 在同一个子线程的 asyncio loop 内同时开启三个隔离的本地 SOCKS5 监听：
+#   127.0.0.1:2001 -> 出站强制锁定【有线/PPP 拨号网卡】（组内轮询）
+#   127.0.0.1:2002 -> 出站强制锁定【无线 Wi-Fi 网卡】（组内轮询）
+#   127.0.0.1:2003 -> 多网卡 Round-Robin 聚合叠加（全部选中网卡轮询）
+# 供 sing-box TUN 的三个 socks 出站对接，实现进程级分流 + 物理多卡叠加。
+PORT_ETHERNET = 2001
+PORT_WIFI = 2002
+PORT_AGGREGATION = 2003
+
+# 网卡分组：有线 6 / PPP 拨号 23，其余（71 等）归为无线
+_IFTYPE_ETHERNET = 6
+_IFTYPE_PPP = 23
+
+
+def classify_nics(selected_nics: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """把选中网卡分成 (有线/PPP 组, 无线组)。
+
+    判定优先级：is_ppp / iftype==23 / iftype==6 归有线组；
+    iftype==71 或别名含 WLAN/Wi-Fi/Wireless 归无线组；
+    无法判定者默认进有线组（更安全的单卡分流出口）。
+    """
+    wired: List[Dict] = []
+    wifi: List[Dict] = []
+    for nic in selected_nics:
+        iftype = int(nic.get("iftype", -1) or -1)
+        alias = str(nic.get("name", nic.get("alias", "")))
+        is_ppp = bool(nic.get("is_ppp", False)) or iftype == _IFTYPE_PPP
+        is_wifi = (iftype == 71) or any(
+            kw.lower() in alias.lower() for kw in ("wlan", "wi-fi", "wifi", "wireless", "无线")
+        )
+        if is_ppp or iftype == _IFTYPE_ETHERNET:
+            wired.append(nic)
+        elif is_wifi:
+            wifi.append(nic)
+        else:
+            wired.append(nic)
+    return wired, wifi
+
+
+class _MergedBalancerView:
+    """把多个 RoundRobinBalancer 的实时连接数合并成一个只读视图，
+    供复用 ProxyWorker._traffic_monitor 时统计 active_connections()。"""
+
+    def __init__(self, balancers):
+        self._balancers = list(balancers)
+
+    def active_connections(self) -> Dict[str, int]:
+        merged: Dict[str, int] = {}
+        for bal in self._balancers:
+            for name, cnt in bal.active_connections().items():
+                merged[name] = merged.get(name, 0) + cnt
+        return merged
+
+
+class _SocksUdpRelayProtocol(asyncio.DatagramProtocol):
+    """SOCKS5 UDP ASSOCIATE 本地 relay。"""
+
+    def __init__(self, owner: "MultiPortProxyWorker", balancer: RoundRobinBalancer, channel: str):
+        self.owner = owner
+        self.balancer = balancer
+        self.channel = channel
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        self.owner._udp_transports.add(transport)
+
+    def datagram_received(self, data: bytes, addr):
+        task = asyncio.create_task(
+            self.owner._handle_udp_packet(data, addr, self.balancer, self.channel, self.transport)
+        )
+        self.owner._client_tasks.add(task)
+        task.add_done_callback(lambda t: self.owner._client_tasks.discard(t))
+
+    def connection_lost(self, exc):
+        if self.transport is not None:
+            self.owner._udp_transports.discard(self.transport)
+
+
+class MultiPortProxyWorker(QThread):
+    """多端口多出站池 SOCKS5 引擎（任务1）。
+
+    与 ProxyWorker 复用同一套接口强绑定 / 透传逻辑，但同时开三个监听端口，
+    每个端口绑定到不同的网卡选择策略（balancer）。
+
+    Signals 与 ProxyWorker 对齐，便于 UI 复用同一套槽函数。
+    """
+
+    log_signal = Signal(str)
+    traffic_signal = Signal(dict)
+    started_ok = Signal(str)
+    stopped = Signal(str)
+    error_signal = Signal(str)
+
+    STOP_TASK_TIMEOUT = 2.0
+    SERVER_CLOSE_TIMEOUT = 1.0
+    DNS_SERVERS = ("223.5.5.5", "119.29.29.29")
+    DNS53_TIMEOUT = 0.8
+    TCP_CONNECT_TIMEOUT = 6.0
+    DOH_PRESETS = {
+        "alidns": (("223.5.5.5", "dns.alidns.com", "/dns-query"),),
+        "dnspod": (
+            ("1.12.12.12", "doh.pub", "/dns-query"),
+            ("120.53.53.53", "doh.pub", "/dns-query"),
+        ),
+        "google": (
+            ("8.8.8.8", "dns.google", "/dns-query"),
+            ("8.8.4.4", "dns.google", "/dns-query"),
+        ),
+    }
+    DEFAULT_DOH_ENDPOINTS = (
+        ("223.5.5.5", "dns.alidns.com", "/dns-query"),
+        ("1.12.12.12", "doh.pub", "/dns-query"),
+        ("120.53.53.53", "doh.pub", "/dns-query"),
+        ("8.8.8.8", "dns.google", "/dns-query"),
+        ("8.8.4.4", "dns.google", "/dns-query"),
+    )
+    DNS_CACHE_TTL = 180.0
+
+    def __init__(
+        self,
+        selected_nics: List[Dict],
+        listen_host: str = "127.0.0.1",
+        ethernet_port: int = PORT_ETHERNET,
+        wifi_port: int = PORT_WIFI,
+        aggregation_port: int = PORT_AGGREGATION,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._selected_nics = [dict(nic) for nic in selected_nics]
+        # 复用 ProxyWorker 的接口索引解析逻辑
+        ProxyWorker._resolve_if_indices(self)
+        self._listen_host = listen_host
+        self._ports = {
+            "nic_ethernet": ethernet_port,
+            "nic_wifi": wifi_port,
+            "aggregation": aggregation_port,
+        }
+
+        wired, wifi = classify_nics(self._selected_nics)
+        # 有线/无线组若为空则回退到全部选中网卡，保证端口始终可用
+        self._wired = wired or self._selected_nics
+        self._wifi = wifi or self._selected_nics
+
+        # 每个端口一个独立 balancer
+        self.bal_ethernet = RoundRobinBalancer(self._wired)
+        self.bal_wifi = RoundRobinBalancer(self._wifi)
+        self.bal_aggregation = RoundRobinBalancer(self._selected_nics)
+        # 复用 ProxyWorker._traffic_monitor 需要 self.balancer.active_connections()，
+        # 这里提供一个合并三通道实时连接数的轻量聚合视图。
+        self.balancer = _MergedBalancerView(
+            [self.bal_ethernet, self.bal_wifi, self.bal_aggregation]
+        )
+
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._servers: List = []
+        self._client_tasks: "set[asyncio.Task]" = set()
+        self._client_writers = set()
+        self._upstream_sockets = set()
+        self._udp_transports = set()
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._stop_requested = False
+        self._configured_dns_servers: Tuple[str, ...] = self.DNS_SERVERS
+        self._doh_endpoints: Tuple[Tuple[str, str, str], ...] = self.DEFAULT_DOH_ENDPOINTS
+        self._dns_cache: Dict[Tuple[int, str], Tuple[float, str]] = {}
+        self._dns_inflight: Dict[Tuple[int, str], asyncio.Task] = {}
+
+    # 复用 ProxyWorker 的静态/实例方法，避免重复实现
+    _create_bound_upstream_socket = staticmethod(ProxyWorker._create_bound_upstream_socket)
+    _relay_to_sock = staticmethod(ProxyWorker._relay_to_sock)
+    _relay_from_sock = staticmethod(ProxyWorker._relay_from_sock)
+    _abort_writer = staticmethod(ProxyWorker._abort_writer)
+    _close_socket = staticmethod(ProxyWorker._close_socket)
+
+    def set_dns_servers(self, servers: List[str]):
+        """设置传统 53 端口 DNS 兜底服务器。"""
+        normalized: List[str] = []
+        for server in servers or []:
+            text = str(server).strip()
+            if self._is_usable_ipv4(text) and text not in normalized:
+                normalized.append(text)
+        for fallback in self.DNS_SERVERS:
+            if fallback not in normalized:
+                normalized.append(fallback)
+        self._configured_dns_servers = tuple(normalized)
+
+    def set_doh_provider(self, provider: str):
+        key = str(provider or "auto").strip().lower()
+        self._doh_endpoints = self.DOH_PRESETS.get(key, self.DEFAULT_DOH_ENDPOINTS)
+
+    def run(self):
+        self._loop = asyncio.new_event_loop()
+        self._loop.set_exception_handler(_quiet_asyncio_exception_handler)
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._serve())
+        except Exception as e:
+            self.error_signal.emit(f"多端口出站池异常退出: {type(e).__name__}: {e}")
+        finally:
+            try:
+                _shutdown_event_loop(self._loop)
+            finally:
+                self._loop = None
+            self.stopped.emit("多端口出站池已停止")
+
+    async def _serve(self):
+        self._stop_event = asyncio.Event()
+        if self._stop_requested:
+            return
+
+        try:
+            # 三个隔离监听：每个绑定不同 balancer
+            self._servers = [
+                await asyncio.start_server(
+                    self._make_handler(self.bal_ethernet, "nic_ethernet"),
+                    self._listen_host, self._ports["nic_ethernet"],
+                ),
+                await asyncio.start_server(
+                    self._make_handler(self.bal_wifi, "nic_wifi"),
+                    self._listen_host, self._ports["nic_wifi"],
+                ),
+                await asyncio.start_server(
+                    self._make_handler(self.bal_aggregation, "aggregation"),
+                    self._listen_host, self._ports["aggregation"],
+                ),
+            ]
+        except Exception as e:
+            await self._teardown()
+            self.error_signal.emit(f"多端口出站池监听失败: {e}")
+            return
+
+        self.log_signal.emit(
+            f"[出站池] 三通道已就绪 | 有线 {self._listen_host}:{self._ports['nic_ethernet']} "
+            f"| 无线 {self._listen_host}:{self._ports['nic_wifi']} "
+            f"| 聚合 {self._listen_host}:{self._ports['aggregation']}"
+        )
+        dns_plan = "; ".join(
+            f"{nic.get('name', nic.get('ip', 'unknown'))}=>{','.join(self._dns_servers_for_nic(nic))}"
+            for nic in self._selected_nics
+        )
+        doh_plan = ",".join(f"{host}@{ip}" for ip, host, _path in self._doh_endpoints)
+        self.log_signal.emit(f"[出站池][DNS] DoH优先 {doh_plan} | 53兜底 {dns_plan}")
+        self.started_ok.emit(
+            f"ethernet={self._ports['nic_ethernet']};wifi={self._ports['nic_wifi']};"
+            f"aggregation={self._ports['aggregation']}"
+        )
+
+        self._monitor_task = asyncio.create_task(self._traffic_monitor())
+        try:
+            await self._stop_event.wait()
+        finally:
+            await self._teardown()
+            self.log_signal.emit("[出站池] 收到停止指令，已关闭三通道并清理在途连接")
+
+    def _make_handler(self, balancer: "RoundRobinBalancer", channel: str):
+        async def handler(reader, writer):
+            await self._handle_socks(reader, writer, balancer, channel)
+        return handler
+
+    @staticmethod
+    def _create_bound_udp_socket(nic) -> socket.socket:
+        """创建出站 UDP socket，并用物理接口索引锁定出口。"""
+        if_index = int(nic.get("if_index", nic.get("index", 0)) or 0)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", if_index))
+            local_ip = nic.get("ip")
+            if local_ip:
+                try:
+                    sock.bind((local_ip, 0))
+                except OSError:
+                    pass
+        except Exception:
+            sock.close()
+            raise
+        return sock
+
+    @staticmethod
+    def _is_usable_ipv4(ip: str) -> bool:
+        parts = str(ip).strip().split(".")
+        if len(parts) != 4 or not all(part.isdigit() for part in parts):
+            return False
+        nums = [int(part) for part in parts]
+        if any(num < 0 or num > 255 for num in nums):
+            return False
+        if nums[0] in (0, 127, 224, 255):
+            return False
+        if nums[0] == 169 and nums[1] == 254:
+            return False
+        if nums[0] == 198 and nums[1] in (18, 19):
+            return False
+        return True
+
+    def _dns_servers_for_nic(self, nic: Dict) -> Tuple[str, ...]:
+        servers: List[str] = []
+        for source in (nic.get("dns_servers", []), self._configured_dns_servers):
+            values = source if isinstance(source, (list, tuple)) else [source]
+            for server in values:
+                text = str(server).strip()
+                if self._is_usable_ipv4(text) and text not in servers:
+                    servers.append(text)
+        for fallback in self.DNS_SERVERS:
+            if fallback not in servers:
+                servers.append(fallback)
+        return tuple(servers)
+
+    @staticmethod
+    def _pack_socks5_udp_header(host: str, port: int, payload: bytes) -> bytes:
+        try:
+            addr = socket.inet_aton(host)
+            return b"\x00\x00\x00\x01" + addr + struct.pack("!H", port) + payload
+        except OSError:
+            encoded = host.encode("idna")[:255]
+            return b"\x00\x00\x00\x03" + bytes([len(encoded)]) + encoded + struct.pack("!H", port) + payload
+
+    @staticmethod
+    def _build_dns_query(domain: str, query_id: int) -> bytes:
+        labels = domain.rstrip(".").encode("idna").split(b".")
+        question = b"".join(bytes([len(label)]) + label for label in labels) + b"\x00"
+        return (
+            struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+            + question
+            + struct.pack("!HH", 1, 1)
+        )
+
+    @staticmethod
+    def _read_dns_name(packet: bytes, offset: int) -> int:
+        jumped = False
+        start = offset
+        limit = 0
+        while offset < len(packet):
+            length = packet[offset]
+            if length == 0:
+                offset += 1
+                return offset if not jumped else start + 2
+            if length & 0xC0 == 0xC0:
+                if offset + 1 >= len(packet):
+                    raise ValueError("bad compressed dns name")
+                if not jumped:
+                    start = offset
+                pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+                offset = pointer
+                jumped = True
+                limit += 1
+                if limit > 16:
+                    raise ValueError("dns compression loop")
+                continue
+            offset += 1 + length
+        raise ValueError("bad dns name")
+
+    @classmethod
+    def _parse_dns_a_response(cls, packet: bytes, query_id: int) -> str:
+        if len(packet) < 12:
+            raise ValueError("short dns response")
+        resp_id, flags, qdcount, ancount, _nscount, _arcount = struct.unpack("!HHHHHH", packet[:12])
+        if resp_id != query_id or (flags & 0x8000) == 0:
+            raise ValueError("mismatched dns response")
+        rcode = flags & 0x000F
+        if rcode != 0:
+            raise ValueError(f"dns rcode={rcode}")
+
+        offset = 12
+        for _ in range(qdcount):
+            offset = cls._read_dns_name(packet, offset)
+            offset += 4
+
+        for _ in range(ancount):
+            offset = cls._read_dns_name(packet, offset)
+            if offset + 10 > len(packet):
+                raise ValueError("truncated dns answer")
+            rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", packet[offset:offset + 10])
+            offset += 10
+            if offset + rdlength > len(packet):
+                raise ValueError("truncated dns rdata")
+            rdata = packet[offset:offset + rdlength]
+            offset += rdlength
+            if rtype == 1 and rclass == 1 and rdlength == 4:
+                ip = socket.inet_ntoa(rdata)
+                if not ip.startswith("198.18.") and not ip.startswith("198.19."):
+                    return ip
+        raise ValueError("no A record")
+
+    async def _query_dns_udp(self, domain: str, nic: Dict, loop, dns_server: str) -> str:
+        query_id = random.randint(0, 0xFFFF)
+        packet = self._build_dns_query(domain, query_id)
+        sock = None
+        try:
+            sock = self._create_bound_udp_socket(nic)
+            self._upstream_sockets.add(sock)
+            await loop.sock_sendto(sock, packet, (dns_server, 53))
+            data, _remote = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, 1232),
+                timeout=self.DNS53_TIMEOUT,
+            )
+            return self._parse_dns_a_response(data, query_id)
+        finally:
+            if sock is not None:
+                self._close_socket(sock)
+                self._upstream_sockets.discard(sock)
+
+    async def _sock_recv_exact(self, sock: socket.socket, loop, size: int, timeout: float) -> bytes:
+        chunks = []
+        remaining = size
+        deadline = time.monotonic() + timeout
+        while remaining > 0:
+            chunk_timeout = max(0.1, deadline - time.monotonic())
+            chunk = await asyncio.wait_for(loop.sock_recv(sock, remaining), timeout=chunk_timeout)
+            if not chunk:
+                raise ConnectionError("dns tcp closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    async def _query_dns_tcp(self, domain: str, nic: Dict, loop, dns_server: str) -> str:
+        query_id = random.randint(0, 0xFFFF)
+        packet = self._build_dns_query(domain, query_id)
+        sock = None
+        try:
+            sock = self._create_bound_upstream_socket(nic)
+            self._upstream_sockets.add(sock)
+            await asyncio.wait_for(loop.sock_connect(sock, (dns_server, 53)), timeout=self.DNS53_TIMEOUT)
+            await asyncio.wait_for(
+                loop.sock_sendall(sock, struct.pack("!H", len(packet)) + packet),
+                timeout=self.DNS53_TIMEOUT,
+            )
+            header = await self._sock_recv_exact(sock, loop, 2, self.DNS53_TIMEOUT)
+            response_len = struct.unpack("!H", header)[0]
+            if response_len <= 0 or response_len > 4096:
+                raise ValueError(f"bad dns tcp length={response_len}")
+            data = await self._sock_recv_exact(sock, loop, response_len, self.DNS53_TIMEOUT)
+            return self._parse_dns_a_response(data, query_id)
+        finally:
+            if sock is not None:
+                self._close_socket(sock)
+                self._upstream_sockets.discard(sock)
+
+    def _query_dns_doh_sync(
+        self,
+        domain: str,
+        nic: Dict,
+        endpoint_ip: str,
+        host: str,
+        path: str,
+    ) -> str:
+        query_id = random.randint(0, 0xFFFF)
+        packet = self._build_dns_query(domain, query_id)
+        sock = None
+        ssl_sock = None
+        try:
+            sock = self._create_bound_upstream_socket(nic)
+            sock.settimeout(4.0)
+            sock.connect((endpoint_ip, 443))
+            context = ssl.create_default_context()
+            ssl_sock = context.wrap_socket(sock, server_hostname=host)
+            ssl_sock.settimeout(8.0)
+            sock = None
+            request = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "Accept: application/dns-message\r\n"
+                "Content-Type: application/dns-message\r\n"
+                f"Content-Length: {len(packet)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii") + packet
+            ssl_sock.sendall(request)
+
+            response = bytearray()
+            while True:
+                try:
+                    chunk = ssl_sock.recv(8192)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if b"\r\n\r\n" in response:
+                    header, body = bytes(response).split(b"\r\n\r\n", 1)
+                    header_text = header.decode("iso-8859-1", errors="replace")
+                    if "Transfer-Encoding: chunked" not in header_text:
+                        content_length = None
+                        for line in header_text.split("\r\n"):
+                            if line.lower().startswith("content-length:"):
+                                try:
+                                    content_length = int(line.split(":", 1)[1].strip())
+                                except ValueError:
+                                    content_length = None
+                                break
+                        if content_length is not None and len(body) >= content_length:
+                            break
+
+            raw = bytes(response)
+            if b"\r\n\r\n" not in raw:
+                raise ValueError("bad doh response")
+            header, body = raw.split(b"\r\n\r\n", 1)
+            header_text = header.decode("iso-8859-1", errors="replace")
+            status_line = header_text.split("\r\n", 1)[0]
+            if " 200 " not in status_line:
+                raise ValueError(status_line)
+            if "Transfer-Encoding: chunked" in header_text:
+                body = self._decode_http_chunked(body)
+            return self._parse_dns_a_response(body, query_id)
+        finally:
+            if ssl_sock is not None:
+                self._close_socket(ssl_sock)
+            if sock is not None:
+                self._close_socket(sock)
+
+    async def _query_dns_doh(
+        self,
+        domain: str,
+        nic: Dict,
+        loop,
+        endpoint_ip: str,
+        host: str,
+        path: str,
+    ) -> str:
+        return await loop.run_in_executor(
+            None,
+            self._query_dns_doh_sync,
+            domain,
+            nic,
+            endpoint_ip,
+            host,
+            path,
+        )
+
+    @staticmethod
+    def _decode_http_chunked(body: bytes) -> bytes:
+        decoded = bytearray()
+        pos = 0
+        while True:
+            line_end = body.find(b"\r\n", pos)
+            if line_end < 0:
+                raise ValueError("bad chunked doh response")
+            size_text = body[pos:line_end].split(b";", 1)[0].strip()
+            size = int(size_text, 16)
+            pos = line_end + 2
+            if size == 0:
+                return bytes(decoded)
+            if pos + size > len(body):
+                raise ValueError("truncated chunked doh response")
+            decoded.extend(body[pos:pos + size])
+            pos += size + 2
+
+    async def _resolve_domain_uncached(self, domain: str, nic: Dict, loop) -> str:
+        errors: List[str] = []
+        for endpoint_ip, host, path in self._doh_endpoints:
+            try:
+                return await self._query_dns_doh(domain, nic, loop, endpoint_ip, host, path)
+            except Exception as e:
+                errors.append(f"doh/{host}@{endpoint_ip} {type(e).__name__}: {e!r}")
+
+        for dns_server in self._dns_servers_for_nic(nic):
+            for method, resolver in (("udp", self._query_dns_udp), ("tcp", self._query_dns_tcp)):
+                try:
+                    return await resolver(domain, nic, loop, dns_server)
+                except Exception as e:
+                    errors.append(f"{method}/{dns_server} {type(e).__name__}: {e!r}")
+
+        try:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM),
+                timeout=2.0,
+            )
+            for info in infos:
+                ip = info[4][0]
+                if self._is_usable_ipv4(ip):
+                    return ip
+            errors.append("system resolver returned no usable A record")
+        except Exception as e:
+            errors.append(f"system {type(e).__name__}: {e!r}")
+
+        raise RuntimeError("; ".join(errors[-8:]) or "dns resolve failed")
+
+    async def _resolve_domain_via_nic(self, domain: str, nic: Dict, loop) -> str:
+        """用绑定到目标物理网卡的 DNS 查询解析域名，避开 TUN/FakeIP 污染。"""
+        cache_key = (int(nic.get("if_index", nic.get("index", 0)) or 0), domain.rstrip(".").lower())
+        now = time.monotonic()
+        cached = self._dns_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        task = self._dns_inflight.get(cache_key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._resolve_domain_uncached(domain, nic, loop))
+            self._dns_inflight[cache_key] = task
+        try:
+            ip = await task
+            self._dns_cache[cache_key] = (time.monotonic() + self.DNS_CACHE_TTL, ip)
+            return ip
+        finally:
+            if self._dns_inflight.get(cache_key) is task and task.done():
+                self._dns_inflight.pop(cache_key, None)
+
+    async def _start_udp_associate(self, reader, writer, balancer, channel):
+        """为一个 SOCKS5 UDP ASSOCIATE TCP 控制连接启动本地 UDP relay。"""
+        loop = asyncio.get_running_loop()
+        transport, _protocol = await loop.create_datagram_endpoint(
+            lambda: _SocksUdpRelayProtocol(self, balancer, channel),
+            local_addr=(self._listen_host, 0),
+        )
+        host, port = transport.get_extra_info("sockname")[:2]
+        writer.write(b"\x05\x00\x00\x01" + socket.inet_aton(host) + struct.pack("!H", port))
+        await writer.drain()
+        try:
+            while await reader.read(1024):
+                pass
+        except Exception:
+            pass
+        finally:
+            transport.close()
+
+    async def _handle_udp_packet(self, data: bytes, client_addr, balancer, channel, transport):
+        if len(data) < 10 or data[2] != 0:
+            return
+        atyp = data[3]
+        pos = 4
+        try:
+            if atyp == 1:
+                dst_host = socket.inet_ntoa(data[pos:pos + 4])
+                pos += 4
+            elif atyp == 3:
+                size = data[pos]
+                pos += 1
+                dst_host = data[pos:pos + size].decode("idna")
+                pos += size
+            else:
+                return
+            dst_port = struct.unpack("!H", data[pos:pos + 2])[0]
+            payload = data[pos + 2:]
+        except Exception:
+            return
+        if not payload:
+            return
+
+        loop = asyncio.get_running_loop()
+        nic = balancer.get_next_nic()
+        balancer.on_connect(nic["name"])
+        sock = None
+        try:
+            sock = self._create_bound_udp_socket(nic)
+            self._upstream_sockets.add(sock)
+            await loop.sock_sendto(sock, payload, (dst_host, dst_port))
+            try:
+                response, remote = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=8.0)
+            except asyncio.TimeoutError:
+                return
+            if response and transport is not None:
+                packet = self._pack_socks5_udp_header(remote[0], remote[1], response)
+                transport.sendto(packet, client_addr)
+        except Exception as e:
+            self.log_signal.emit(f"[出站池-{channel}][UDP异常] {type(e).__name__}: {e}")
+        finally:
+            if sock is not None:
+                self._close_socket(sock)
+                self._upstream_sockets.discard(sock)
+            balancer.on_disconnect(nic["name"])
+
+    async def _handle_socks(self, reader, writer, balancer, channel):
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
+        self._client_writers.add(writer)
+
+        nic = None
+        upstream_sock = None
+        relay_tasks = []
+        try:
+            # SOCKS5 握手
+            version, nmethods = await reader.readexactly(2)
+            await reader.readexactly(nmethods)
+            writer.write(b"\x05\x00")
+            await writer.drain()
+
+            version, cmd, rsv, atyp = await reader.readexactly(4)
+            if cmd not in (1, 3):
+                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                writer.close()
+                return
+
+            loop = asyncio.get_running_loop()
+            dst_domain = None
+            if atyp == 1:
+                dst_addr = socket.inet_ntoa(await reader.readexactly(4))
+            elif atyp == 3:
+                domain_len = ord(await reader.readexactly(1))
+                dst_domain = (await reader.readexactly(domain_len)).decode()
+                dst_addr = ""
+            else:
+                writer.close()
+                return
+
+            dst_port = struct.unpack("!H", await reader.readexactly(2))[0]
+            target_display = dst_domain if dst_domain else dst_addr
+
+            if cmd == 3:
+                await self._start_udp_associate(reader, writer, balancer, channel)
+                return
+
+            nic = balancer.get_next_nic()
+            balancer.on_connect(nic["name"])
+            if dst_domain:
+                try:
+                    dst_addr = await self._resolve_domain_via_nic(dst_domain, nic, loop)
+                except Exception as e:
+                    self.log_signal.emit(
+                        f"[出站池-{channel}][DNS失败] {nic['name']} -> {dst_domain}: {type(e).__name__}: {e}"
+                    )
+                    writer.close()
+                    return
+            self.log_signal.emit(
+                f"[出站池-{channel}][TCP] {nic['name']} -> {target_display}:{dst_port} ({dst_addr})"
+            )
+            try:
+                upstream_sock = self._create_bound_upstream_socket(nic)
+                self._upstream_sockets.add(upstream_sock)
+            except Exception as e:
+                self.log_signal.emit(f"[出站池-{channel}][绑定崩溃] {nic['name']}: {e}")
+                writer.close()
+                return
+
+            try:
+                await asyncio.wait_for(
+                    loop.sock_connect(upstream_sock, (dst_addr, dst_port)),
+                    timeout=self.TCP_CONNECT_TIMEOUT,
+                )
+            except Exception as e:
+                self.log_signal.emit(
+                    f"[出站池-{channel}][连通失败] {nic['name']} -> {target_display}:{dst_port} "
+                    f"({dst_addr}) | {type(e).__name__}: {e}"
+                )
+                writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                writer.close()
+                self._close_socket(upstream_sock)
+                self._upstream_sockets.discard(upstream_sock)
+                upstream_sock = None
+                return
+
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+
+            relay_tasks = [
+                asyncio.create_task(self._relay_to_sock(reader, upstream_sock, loop)),
+                asyncio.create_task(self._relay_from_sock(upstream_sock, writer, loop)),
+            ]
+            self._client_tasks.update(relay_tasks)
+            _, pending = await asyncio.wait(relay_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+        except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.CancelledError):
+            pass
+        except Exception as e:
+            self.log_signal.emit(f"[出站池-{channel}][连接异常] {type(e).__name__}: {e}")
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            if upstream_sock is not None:
+                self._close_socket(upstream_sock)
+                self._upstream_sockets.discard(upstream_sock)
+            self._client_writers.discard(writer)
+            if nic is not None:
+                balancer.on_disconnect(nic["name"])
+            for rt in relay_tasks:
+                self._client_tasks.discard(rt)
+            if task is not None:
+                self._client_tasks.discard(task)
+
+    async def _teardown(self):
+        for server in self._servers:
+            try:
+                server.close()
+            except Exception:
+                pass
+        for writer in list(self._client_writers):
+            self._abort_writer(writer)
+        for transport in list(self._udp_transports):
+            try:
+                transport.close()
+            except Exception:
+                pass
+        for sock in list(self._upstream_sockets):
+            self._close_socket(sock)
+
+        if self._monitor_task is not None and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        for task in list(self._client_tasks):
+            if not task.done():
+                task.cancel()
+        if self._client_tasks:
+            await asyncio.wait(list(self._client_tasks), timeout=self.STOP_TASK_TIMEOUT)
+
+        for server in self._servers:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=self.SERVER_CLOSE_TIMEOUT)
+            except Exception:
+                pass
+
+        self._servers = []
+        self._client_tasks.clear()
+        self._client_writers.clear()
+        self._udp_transports.clear()
+        self._upstream_sockets.clear()
+        self._monitor_task = None
+
+    def stop(self):
+        self._stop_requested = True
+        loop = self._loop
+        event = self._stop_event
+        if loop is not None and event is not None:
+            loop.call_soon_threadsafe(event.set)
+
+    # 复用 ProxyWorker 的遥测实现（聚合三通道整体网卡吞吐）
+    _traffic_monitor = ProxyWorker._traffic_monitor

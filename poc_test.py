@@ -52,7 +52,7 @@ def download_worker(if_index, nic_ip, task_name):
         
         # 连接服务器
         secure_sock.connect((host, port))
-        print(f"[✅ 成功] {task_name} 已连通服务器！开始疯狂拉取数据...")
+        print(f"[成功] {task_name} 已连通服务器！开始疯狂拉取数据...")
         
         # 5. 手搓 HTTP GET 请求 (下载 Ubuntu 24.04 ISO 镜像)
         request = (f"GET /ubuntu-releases/24.04/ubuntu-24.04-desktop-amd64.iso HTTP/1.1\r\n"

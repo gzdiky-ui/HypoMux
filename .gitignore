@@ -2,8 +2,20 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
 build/
 dist/
+Output/
 *.egg-info
+*.log
+*.tmp
 NetBooster.exe
 nuitka-crash-report.xml
+
+# Local/generated runtime config. The app persists user config under ~/.hypomux.
+config.json
+
+# Rust 诊断内核：忽略编译中间产物，但保留根目录待打包的 diagnostic.exe
+hypomux-diagnostic/target/
+

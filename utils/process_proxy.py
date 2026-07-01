@@ -255,7 +255,7 @@ $Shortcut.Save()
             )
 
             if result.returncode == 0:
-                return True, f"✅ 已创建 {app_name} 加速启动器\n\n📁 脚本位置: {script_path}\n🖥️ 桌面快捷方式: {shortcut_name}\n\n使用桌面快捷方式启动 {app_name} 即可享受多网卡加速！", script_path
+                return True, f"已创建 {app_name} 加速启动器\n\n脚本位置: {script_path}\n桌面快捷方式: {shortcut_name}\n\n使用桌面快捷方式启动 {app_name} 即可享受多网卡加速！", script_path
             else:
                 return False, f"创建快捷方式失败: {result.stderr}", script_path
 

@@ -64,6 +64,29 @@ _ERROR_BUFFER_OVERFLOW = 111
 _ERROR_SUCCESS = 0
 _IF_OPER_STATUS_UP = 1           # IfOperStatusUp
 
+# ===== 接口类型 (IfType, 来自 IANA ifType / Win32 IPIFCONS.H) =====
+# 任务1 核心：拨号上网 (PPPoE「宽带连接」) 会生成 WAN Miniport PPP 虚拟接口，
+# 其 IfType == 23 (IF_TYPE_PPP)。旧逻辑只认物理以太网/WLAN，导致 PPP 链路被
+# 丢弃、上层强行 bind 被架空的物理网卡 IP → WinError 1231。
+# 这里把 PPP 显式纳入白名单，并排除回环 / 隧道等无意义出口。
+_IF_TYPE_ETHERNET_CSMACD = 6     # 物理以太网
+_IF_TYPE_PPP = 23                # 拨号 PPP / PPPoE 宽带连接虚拟网卡
+_IF_TYPE_SOFTWARE_LOOPBACK = 24  # 回环（排除）
+_IF_TYPE_IEEE80211 = 71          # 无线 WLAN
+_IF_TYPE_TUNNEL = 131            # 隧道（排除，避免 Teredo/ISATAP 干扰）
+
+# 允许进入加速池的接口类型白名单：物理以太网 / WLAN / PPP 拨号
+_ALLOWED_IF_TYPES = {
+    _IF_TYPE_ETHERNET_CSMACD,
+    _IF_TYPE_PPP,
+    _IF_TYPE_IEEE80211,
+}
+# 明确排除的接口类型（即便 UP 也不作为出站链路）
+_EXCLUDED_IF_TYPES = {
+    _IF_TYPE_SOFTWARE_LOOPBACK,
+    _IF_TYPE_TUNNEL,
+}
+
 
 class _SOCKADDR(ctypes.Structure):
     _fields_ = [
@@ -83,6 +106,10 @@ class _IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
     pass
 
 
+class _IP_ADAPTER_DNS_SERVER_ADDRESS(ctypes.Structure):
+    pass
+
+
 _IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
     ("Length", wintypes.ULONG),
     ("Flags", wintypes.DWORD),
@@ -95,6 +122,14 @@ _IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
     ("PreferredLifetime", wintypes.ULONG),
     ("LeaseLifetime", wintypes.ULONG),
     ("OnLinkPrefixLength", ctypes.c_ubyte),
+]
+
+
+_IP_ADAPTER_DNS_SERVER_ADDRESS._fields_ = [
+    ("Length", wintypes.ULONG),
+    ("Reserved", wintypes.DWORD),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_DNS_SERVER_ADDRESS)),
+    ("Address", _SOCKET_ADDRESS),
 ]
 
 
@@ -147,6 +182,23 @@ def _sockaddr_to_ipv4(socket_address: _SOCKET_ADDRESS) -> Optional[str]:
     return socket.inet_ntoa(raw)
 
 
+def _adapter_dns_servers_ipv4(adapter: _IP_ADAPTER_ADDRESSES) -> List[str]:
+    """读取网卡自身的 IPv4 DNS 服务器列表。"""
+    servers: List[str] = []
+    dns_ptr = None
+    if adapter.FirstDnsServerAddress:
+        dns_ptr = ctypes.cast(
+            adapter.FirstDnsServerAddress,
+            ctypes.POINTER(_IP_ADAPTER_DNS_SERVER_ADDRESS),
+        )
+    while dns_ptr:
+        dns = _sockaddr_to_ipv4(dns_ptr.contents.Address)
+        if dns and dns not in servers:
+            servers.append(dns)
+        dns_ptr = dns_ptr.contents.Next
+    return servers
+
+
 def get_adapter_if_indices() -> Dict[str, int]:
     """
     调用 GetAdaptersAddresses，返回 {IPv4 地址: IfIndex} 的映射。
@@ -162,7 +214,7 @@ def get_adapter_if_indices() -> Dict[str, int]:
     ip_to_index: Dict[str, int] = {}
     try:
         iphlpapi = ctypes.windll.Iphlpapi
-        flags = _GAA_FLAG_SKIP_ANYCAST | _GAA_FLAG_SKIP_MULTICAST | _GAA_FLAG_SKIP_DNS_SERVER
+        flags = _GAA_FLAG_SKIP_ANYCAST | _GAA_FLAG_SKIP_MULTICAST
 
         buf_len = wintypes.ULONG(15 * 1024)  # 初始 15KB，按官方建议预分配
         for _ in range(3):  # 缓冲区不足时按返回的 SizePointer 重试
@@ -218,6 +270,106 @@ def resolve_if_index(ipv4: str, fallback: Optional[int] = None) -> Optional[int]
         return fallback
     mapping = get_adapter_if_indices()
     return mapping.get(ipv4, fallback)
+
+
+def _is_routable_ipv4(ip: str) -> bool:
+    """判断一个 IPv4 是否可作为有效出站源（排除回环 / 链路本地 / 全零）。
+
+    - 127.0.0.0/8       回环
+    - 169.254.0.0/16    APIPA 链路本地（拿不到 DHCP 时的兜底地址，不可路由）
+    - 0.0.0.0           未配置
+    PPPoE 拨号分配到的动态公网/运营商 IP 会顺利通过本校验。
+    """
+    if not ip:
+        return False
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    if a == 127:                       # 回环
+        return False
+    if a == 169 and b == 254:          # APIPA 链路本地
+        return False
+    if a == 0:                         # 未配置
+        return False
+    return True
+
+
+def get_adapter_full_info() -> List[Dict]:
+    """
+    调用 GetAdaptersAddresses，原生枚举所有 UP 网卡（含 PPP 拨号虚拟网卡）。
+
+    【任务1 核心】GetAdaptersAddresses 是 Win32 IPHLPAPI 的权威枚举接口，
+    它能直接列出 WAN Miniport PPP（IfType=23）拨号网卡，并给出其分配到的
+    真实动态 IP 与 IfIndex —— 而 Get-NetAdapter 往往看不到 PPP 接口，这正是
+    旧扫描漏掉「宽带连接」、上层误绑物理网卡 IP 触发 WinError 1231 的根因。
+
+    Returns:
+        List[Dict]: 每项 {index, iftype, friendly, ipv4_list}
+                    仅包含 OperStatus=Up、且接口类型不在排除集合中的网卡。
+                    失败时返回空列表（上层应有回退逻辑）。
+    """
+    results: List[Dict] = []
+    try:
+        iphlpapi = ctypes.windll.Iphlpapi
+        flags = _GAA_FLAG_SKIP_ANYCAST | _GAA_FLAG_SKIP_MULTICAST
+
+        buf_len = wintypes.ULONG(15 * 1024)
+        ret = _ERROR_BUFFER_OVERFLOW
+        buffer = None
+        for _ in range(3):
+            buffer = ctypes.create_string_buffer(buf_len.value)
+            ret = iphlpapi.GetAdaptersAddresses(
+                _AF_INET, flags, None,
+                ctypes.cast(buffer, ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
+                ctypes.byref(buf_len),
+            )
+            if ret == _ERROR_BUFFER_OVERFLOW:
+                continue
+            break
+
+        if ret != _ERROR_SUCCESS or buffer is None:
+            logger.warning(f"get_adapter_full_info: GetAdaptersAddresses 返回 {ret}")
+            return results
+
+        adapter_ptr = ctypes.cast(buffer, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+        while adapter_ptr:
+            adapter = adapter_ptr.contents
+            iftype = int(adapter.IfType)
+            oper_up = (adapter.OperStatus == _IF_OPER_STATUS_UP)
+
+            # 排除回环 / 隧道；仅保留 UP 且 IfIndex 有效的网卡
+            if oper_up and adapter.IfIndex != 0 and iftype not in _EXCLUDED_IF_TYPES:
+                ipv4_list: List[str] = []
+                dns_servers = _adapter_dns_servers_ipv4(adapter)
+                unicast_ptr = adapter.FirstUnicastAddress
+                while unicast_ptr:
+                    unicast = unicast_ptr.contents
+                    ipv4 = _sockaddr_to_ipv4(unicast.Address)
+                    if ipv4 and _is_routable_ipv4(ipv4):
+                        ipv4_list.append(ipv4)
+                    unicast_ptr = unicast.Next
+
+                if ipv4_list:
+                    friendly = adapter.FriendlyName or ""
+                    results.append({
+                        "index": int(adapter.IfIndex),
+                        "iftype": iftype,
+                        "is_ppp": iftype == _IF_TYPE_PPP,
+                        "friendly": friendly,
+                        "ipv4_list": ipv4_list,
+                        "dns_servers": dns_servers,
+                    })
+            adapter_ptr = adapter.Next
+
+        logger.info(f"get_adapter_full_info: 枚举到 {len(results)} 个可用网卡（含 PPP={sum(1 for r in results if r['is_ppp'])}）")
+    except Exception as e:
+        logger.error(f"get_adapter_full_info 调用异常: {type(e).__name__}: {e}")
+
+    return results
 
 
 # ========== 管理员权限检测与提权 ==========
@@ -283,14 +435,15 @@ def _run_powershell_command(command: str, timeout: int = 10) -> Tuple[bool, str]
     """
     try:
         startupinfo = _get_windows_startupinfo()
+        utf8_command = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + command
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+            ["powershell", "-NoProfile", "-Command", utf8_command],
             capture_output=True,
             text=True,
             timeout=timeout,
             startupinfo=startupinfo,
-            encoding='mbcs',
-            errors='replace'
+            encoding="utf-8",
+            errors="replace",
         )
 
         stdout = (result.stdout or "").strip()
@@ -325,12 +478,21 @@ def _parse_adapter_from_json(adapter_json: Dict) -> Optional[Dict]:
         Dict 或 None: 解析后的网卡信息，失败返回 None
     """
     try:
+        iftype = int(adapter_json.get("IfType") or -1)
+        alias = adapter_json.get("InterfaceAlias", "Unknown")
+        # PPP 判定：IfType=23，或别名含拨号/宽带特征词
+        is_ppp = (iftype == _IF_TYPE_PPP) or any(
+            kw in str(alias) for kw in ("PPP", "宽带", "Broadband", "Dial")
+        )
         adapter_info = {
             "index": int(adapter_json.get("InterfaceIndex", -1)),
-            "alias": adapter_json.get("InterfaceAlias", "Unknown"),
+            "alias": alias,
             "ipv4": adapter_json.get("IPv4Address", "N/A"),
+            "dns_servers": _normalize_dns_servers(adapter_json.get("DNSServers")),
             "is_auto": adapter_json.get("AutomaticMetric", True),
             "metric": int(adapter_json.get("InterfaceMetric") or -1),
+            "iftype": iftype,
+            "is_ppp": is_ppp,
         }
         return adapter_info
     except Exception as e:
@@ -338,97 +500,152 @@ def _parse_adapter_from_json(adapter_json: Dict) -> Optional[Dict]:
         return None
 
 
+def _normalize_dns_servers(raw) -> List[str]:
+    """规整 PowerShell / 原生枚举返回的 DNS 服务器字段。"""
+    values: List[str] = []
+    if isinstance(raw, list):
+        candidates = raw
+    elif raw:
+        candidates = str(raw).replace(";", ",").split(",")
+    else:
+        candidates = []
+    for item in candidates:
+        text = str(item).strip()
+        parts = text.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            if text not in values:
+                values.append(text)
+    return values
+
+
 def scan_network_adapters() -> Tuple[bool, List[Dict], str]:
     """
-    扫描系统中所有已连接且拥有 IPv4 地址的网卡
-    
-    使用 PowerShell 的 Get-NetIPInterface 和 Get-NetAdapter 获取网卡列表，
+    扫描系统中所有已连接且拥有 IPv4 地址的网卡（含 PPPoE 拨号虚拟网卡）。
+
+    【任务1 修复】采用「双引擎合并」策略根治拨号上网无法加速的 Bug：
+    1. PowerShell (Get-NetIPInterface) 主引擎：覆盖物理以太网/WLAN。
+    2. GetAdaptersAddresses 原生引擎 (get_adapter_full_info) 补全：
+       专门捞回 PowerShell 常常遗漏的 WAN Miniport PPP (IfType=23) 拨号网卡，
+       并以其【真实分配到的动态 IP】入池，避免误绑被架空的物理网卡 IP。
+
     过滤条件：
-    - Status 为 "Up" (已连接)
-    - AddressFamily 为 IPv4
-    - 拥有有效的 IPv4 地址
-    
+    - 接口处于 Up / Connected
+    - 接口类型属于白名单（以太网 / WLAN / PPP），排除回环、隧道
+    - 拥有有效可路由 IPv4（排除 127.x / 169.254.x / 0.x）
+
     Returns:
-        Tuple[bool, List[Dict], str]: 
-            - 第1个元素：是否成功获取（True/False）
-            - 第2个元素：网卡信息列表（每项包含 index/alias/ipv4/is_auto/metric）
-            - 第3个元素：错误信息或空字符串
+        Tuple[bool, List[Dict], str]:
+            - 是否成功获取
+            - 网卡信息列表（每项含 index/alias/ipv4/is_auto/metric/iftype/is_ppp）
+            - 错误信息或空字符串
     """
-    # PowerShell 命令：获取所有 IPv4 接口并转换为 JSON
+    # PowerShell 命令：抓取 IPv4 接口。新增 ifType 字段，并放宽 PPP 接口
+    # （PPP 接口的 Get-NetAdapter Status 常为非 'Up'，故对 PPP 单独放行）。
     ps_command = """
     $adapters = @()
     $interfaces = Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.ConnectionState -eq 'Connected' }
-    
+
     foreach ($interface in $interfaces) {
         $ifIndex = $interface.InterfaceIndex
         $ifAlias = $interface.InterfaceAlias
         $autoMetric = $interface.AutomaticMetric
         $ifMetric = $interface.InterfaceMetric
-        
-        # 获取该接口的 IPv4 地址
+
         $ipv4Addr = (Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-        
-        # 获取网卡的运行状态
+        $dnsServers = @(
+            Get-DnsClientServerAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty ServerAddresses -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^\\d{1,3}(\\.\\d{1,3}){3}$' }
+        )
+
         $adapter = Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue
         $status = $adapter.Status
-        
-        if ($status -eq 'Up' -and $ipv4Addr) {
+        $ifType = $adapter.ifType
+
+        # PPP 拨号接口 (ifType=23) 即便 Get-NetAdapter 状态非 Up 也放行，
+        # 只要它拿到了有效 IPv4，就是一条真实可用的宽带拨号链路。
+        $isPpp = ($ifType -eq 23) -or ($ifAlias -match 'PPP' -or $ifAlias -match '宽带' -or $ifAlias -match 'Broadband' -or $ifAlias -match 'Dial')
+
+        if ($ipv4Addr -and (($status -eq 'Up') -or $isPpp)) {
             $adapters += @{
                 InterfaceIndex = $ifIndex
                 InterfaceAlias = $ifAlias
                 IPv4Address = $ipv4Addr
+                DNSServers = $dnsServers
                 AutomaticMetric = $autoMetric
                 InterfaceMetric = $ifMetric
                 Status = $status
+                IfType = $ifType
             }
         }
     }
-    
+
     $adapters | ConvertTo-Json -Depth 2
     """
-    
-    success, output, error_msg = False, [], ""
-    
+
     try:
-        # 执行 PowerShell 命令
         ps_success, ps_output = _run_powershell_command(ps_command, timeout=15)
 
-        if not ps_success:
-            error_msg = f"PowerShell 执行失败: {ps_output}"
-            logger.error(error_msg)
-            return False, [], error_msg
-        
-        if not ps_output or ps_output.lower() == "null":
-            logger.info("未找到已连接且拥有 IPv4 的网卡")
-            return True, [], ""
-        
-        # 解析 JSON 结果
+        adapters: List[Dict] = []
+        seen_indices = set()
+
+        if ps_success and ps_output and ps_output.lower() != "null":
+            try:
+                adapters_json = json.loads(ps_output)
+                if isinstance(adapters_json, dict):
+                    adapters_json = [adapters_json]
+                if isinstance(adapters_json, list):
+                    for adapter_json in adapters_json:
+                        adapter_info = _parse_adapter_from_json(adapter_json)
+                        if adapter_info and adapter_info["index"] not in seen_indices:
+                            adapters.append(adapter_info)
+                            seen_indices.add(adapter_info["index"])
+                            logger.info(
+                                f"[PS] 网卡: {adapter_info['alias']} "
+                                f"(Index: {adapter_info['index']}, IPv4: {adapter_info['ipv4']}, "
+                                f"PPP: {adapter_info.get('is_ppp')})"
+                            )
+            except json.JSONDecodeError as e:
+                logger.warning(f"PowerShell 输出 JSON 解析失败，将仅依赖原生枚举: {e}")
+        else:
+            logger.warning(f"PowerShell 扫描未返回有效数据，将依赖原生枚举补全: {ps_output[:120] if ps_output else ''}")
+
+        # ===== 原生 GetAdaptersAddresses 补全 PPP 等被 PS 漏掉的网卡 =====
         try:
-            adapters_json = json.loads(ps_output)
-        except json.JSONDecodeError as e:
-            error_msg = f"解析 PowerShell 输出 JSON 失败: {e}\n原始输出: {ps_output[:200]}"
+            native = get_adapter_full_info()
+            for n in native:
+                if n["index"] in seen_indices:
+                    continue
+                # 取第一个可路由 IPv4 作为该网卡出口
+                ipv4 = n["ipv4_list"][0] if n["ipv4_list"] else ""
+                if not ipv4:
+                    continue
+                alias = n["friendly"] or f"Adapter-{n['index']}"
+                adapters.append({
+                    "index": n["index"],
+                    "alias": alias,
+                    "ipv4": ", ".join(n["ipv4_list"]),
+                    "dns_servers": n.get("dns_servers", []),
+                    "is_auto": True,
+                    "metric": -1,
+                    "iftype": n["iftype"],
+                    "is_ppp": n["is_ppp"],
+                })
+                seen_indices.add(n["index"])
+                logger.info(
+                    f"[Native] 补全网卡: {alias} (Index: {n['index']}, IPv4: {ipv4}, PPP: {n['is_ppp']})"
+                )
+        except Exception as e:
+            logger.warning(f"原生枚举补全失败（不影响已扫描结果）: {e}")
+
+        if not ps_success and not adapters:
+            error_msg = f"PowerShell 执行失败且原生枚举无结果: {ps_output}"
             logger.error(error_msg)
             return False, [], error_msg
-        
-        # 确保 adapters_json 是列表
-        if isinstance(adapters_json, dict):
-            adapters_json = [adapters_json]
-        elif not isinstance(adapters_json, list):
-            error_msg = f"PowerShell 返回的数据类型不是列表或字典: {type(adapters_json)}"
-            logger.error(error_msg)
-            return False, [], error_msg
-        
-        # 解析每个网卡信息
-        adapters = []
-        for adapter_json in adapters_json:
-            adapter_info = _parse_adapter_from_json(adapter_json)
-            if adapter_info:
-                adapters.append(adapter_info)
-                logger.info(f"发现网卡: {adapter_info['alias']} (Index: {adapter_info['index']}, IPv4: {adapter_info['ipv4']})")
-        
-        logger.info(f"共发现 {len(adapters)} 个可用网卡")
+
+        logger.info(f"共发现 {len(adapters)} 个可用网卡（含 PPP）")
         return True, adapters, ""
-    
+
     except Exception as e:
         error_msg = f"扫描网卡时发生异常: {type(e).__name__}: {str(e)}"
         logger.error(error_msg)

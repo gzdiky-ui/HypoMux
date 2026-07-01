@@ -12,7 +12,7 @@ IP_UNICAST_IF = 31
 
 NIC_ETH = {"name": "以太网", "index": 19, "ip": "10.20.236.208"}
 
-# ⚠️ 极其重要：请在终端输入 ipconfig 确认 WLAN IPv4 地址还是不是 80！
+# 极其重要：请在终端输入 ipconfig 确认 WLAN IPv4 地址还是不是 80！
 NIC_WLAN = {"name": "WLAN", "index": 11, "ip": "192.168.31.80"} 
 
 # ==========================================

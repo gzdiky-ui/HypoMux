@@ -1,34 +1,101 @@
 """
-HypoMux 主窗口界面 - v2.0 (QStackedWidget 翻页架构)
-使用 QFluentWidgets 实现 Windows 11 Fluent Design 风格
+HypoMux 主窗口 - v3.0 (FluentWindow 侧边导航架构)
 
-关键特性：所有 Qt 和 qfluentwidgets 导入都延迟到 MainWindow 初始化时
-确保 QApplication 已存在，避免 "Must construct a QApplication before a QWidget" 错误
+第三阶段全盘换装：MainWindow 继承 qfluentwidgets.FluentWindow，
+左侧 Windows 11 风格侧边导航 + 四个子页面（首页/路由/体检/设置）。
 
-【Phase 4A 重构】
-接入系统级 HTTP/HTTPS/SOCKS 注册表锁，由 ProxyWorker 驱动双协议无感加速。
-- 「一键加速」在双端口监听成功后接管 Windows 系统代理；
-- 停止、窗口关闭、异常收尾均强制关闭系统代理；
-- 实时网速、各网卡连接数、调度日志全部由 ProxyWorker 的
-  traffic_signal / log_signal 驱动，点亮分流监控大屏。
+MainWindow 仅作「后端宿主 + 调度中枢」：
+- 持有 ProxyWorker 生命周期、ScanWorker、DiagnosticWorker、配置、系统托盘
+- 四个子页面是纯视图，经 Qt 信号上抛意图、经公开方法接收回填
+
+后端引擎（ProxyWorker / config_manager / autostart / diagnostic_runner）零改动，
+仅把第一/二阶段的槽函数与数据流重新绑定到新的 Fluent 组件上。
+
+关键特性：所有 Qt 与 qfluentwidgets 导入都延迟到工厂函数内，确保
+QApplication 已存在，避免 "Must construct a QApplication before a QWidget"。
 """
 
 import ctypes
+import logging
+import subprocess
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import List, Dict
 import winreg
 
 from utils.network_utils import scan_network_adapters
-from proxy_worker import ProxyWorker
+from utils.config_manager import load_config, save_config
+from utils.diagnostic_runner import run_diagnostic, DEFAULT_TARGET_IP
+from proxy_worker import ProxyWorker, MultiPortProxyWorker
+from utils.tun_manager import TunManager
+from utils import singbox_config
 
 
 DEFAULT_SOCKS_PORT = 10800
 DEFAULT_HTTP_PORT = 10801
 
 
+def _build_app_logger() -> logging.Logger:
+    """构建用户目录滚动日志，替代首页可视控制台。"""
+    logger = logging.getLogger("hypomux.app")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    log_dir = Path.home() / ".hypomux" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "app.log",
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    try:
+        handler.doRollover()
+    except Exception:
+        pass
+    logger.propagate = False
+    return logger
+
+
+APP_LOGGER = _build_app_logger()
+
+
+def detect_foreign_tun_default_route() -> str:
+    """检测会抢占默认路由的第三方虚拟隧道接口。"""
+    pattern = "meta|clash|mihomo|tun|wintun|wireguard|tailscale|vpn|tap"
+    command = (
+        "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' "
+        "-ErrorAction SilentlyContinue | "
+        f"Where-Object {{ $_.InterfaceAlias -match '{pattern}' }} | "
+        "Select-Object -First 1 -ExpandProperty InterfaceAlias"
+    )
+    try:
+        startupinfo = None
+        if hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            startupinfo=startupinfo,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+        if result.returncode == 0:
+            return (result.stdout or "").strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    except Exception:
+        pass
+    return ""
+
+
 def get_steam_pids() -> List[int]:
     """返回正在运行的 steam.exe PID，用于开启加速前提醒。"""
     pids: List[int] = []
-
     try:
         import psutil
         for proc in psutil.process_iter(["pid", "name"]):
@@ -60,7 +127,6 @@ def get_steam_pids() -> List[int]:
                         pass
         except Exception:
             pass
-
     return sorted(pids)
 
 
@@ -72,10 +138,7 @@ def set_system_proxy(
     """Enable or disable the current user's WinINet HTTP/HTTPS/SOCKS proxy."""
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        key_path,
-        0,
-        winreg.KEY_WRITE,
+        winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE,
     ) as key:
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1 if enable else 0)
         if enable:
@@ -88,26 +151,107 @@ def set_system_proxy(
     ctypes.windll.Wininet.InternetSetOptionW(0, 37, 0, 0)
 
 
+def _first_valid_ipv4(raw) -> str:
+    """从扫描结果里提取第一个有效的 IPv4 地址（兼容字符串/逗号/列表）。"""
+    candidates: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            candidates.extend(str(item).split(","))
+    else:
+        candidates.extend(str(raw).split(","))
+    for cand in candidates:
+        ip = cand.strip()
+        parts = ip.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            return ip
+    return ""
+
+
 def create_main_window():
     """工厂函数：创建 MainWindow 实例（此时 QApplication 已存在）"""
-    # 延迟导入所有 Qt 和 qfluentwidgets
-    from PySide6.QtWidgets import (
-        QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-        QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QCheckBox,
-        QFrame, QToolButton, QPlainTextEdit,
-        QAbstractItemView, QSystemTrayIcon, QMenu,
-    )
-    from PySide6.QtCore import Qt, QThread, Signal, Slot, QRectF, QTimer, QSettings
-    from PySide6.QtGui import QFont, QIcon, QPainterPath, QRegion, QAction
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QSettings, QRect, QRectF, QPoint
+    from PySide6.QtGui import QIcon, QAction, QFont, QPainter, QColor, QCursor
+    from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QWidget
     from qfluentwidgets import (
-        PushButton, PrimaryPushButton, InfoBar, InfoBarPosition,
-        setThemeColor,
+        FluentWindow, NavigationItemPosition, InfoBar, InfoBarPosition,
+        setThemeColor, setTheme, Theme, FluentIcon, qconfig, MessageBox,
     )
     setThemeColor("#0078d4")
 
-    from ui.settings_page import SettingsWidget
+    # 启动即应用持久化主题（浅色/深色/跟随系统）
+    _theme_settings = QSettings("Hypostasis-Cat", "HypoMux")
+    _theme_map = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
+    setTheme(_theme_map.get(_theme_settings.value("theme", "auto"), Theme.AUTO))
+
     from ui.i18n import tr
-    from ui.components import SlidingStackedWidget
+    from ui.pages import resolve_icon
+    from ui.pages.home_page import HomePage
+    from ui.pages.routing_page import RoutingPage
+    from ui.pages.tools_page import ToolsPage
+    from ui.pages.settings_page import SettingsPage
+    from ui.pages.about_page import AboutPage
+
+    def _patch_navigation_icon_paint():
+        try:
+            from qfluentwidgets.components.navigation.navigation_widget import NavigationPushButton
+            from qfluentwidgets.common.config import isDarkTheme
+            from qfluentwidgets.common.icon import drawIcon
+            from qfluentwidgets.common.color import autoFallbackThemeColor
+        except Exception:
+            return
+
+        if getattr(NavigationPushButton, "_hypomux_icon_patch", False):
+            return
+
+        def paint_event(self, event):
+            painter = QPainter(self)
+            painter.setRenderHints(
+                QPainter.Antialiasing
+                | QPainter.TextAntialiasing
+                | QPainter.SmoothPixmapTransform
+            )
+            painter.setPen(Qt.NoPen)
+
+            if self.isPressed:
+                painter.setOpacity(0.7)
+            if not self.isEnabled():
+                painter.setOpacity(0.4)
+
+            c = 255 if isDarkTheme() else 0
+            margins = self._margins()
+            pl, pr = margins.left(), margins.right()
+            global_rect = QRect(self.mapToGlobal(QPoint()), self.size())
+
+            if self._canDrawIndicator():
+                painter.setBrush(QColor(c, c, c, 6 if self.isEnter else 10))
+                painter.drawRoundedRect(self.rect(), 5, 5)
+                painter.setBrush(autoFallbackThemeColor(self.lightIndicatorColor, self.darkIndicatorColor))
+                painter.drawRoundedRect(self.indicatorRect(), 1.5, 1.5)
+            elif ((self.isEnter and global_rect.contains(QCursor.pos())) or self.isAboutSelected) and self.isEnabled():
+                painter.setBrush(QColor(c, c, c, 6 if self.isAboutSelected else 10))
+                painter.drawRoundedRect(self.rect(), 5, 5)
+
+            icon_size = 20
+            icon_x = 10 + pl
+            icon_y = (self.height() - icon_size) / 2
+            drawIcon(self._icon, painter, QRectF(icon_x, icon_y, icon_size, icon_size))
+
+            if self.isCompacted:
+                return
+
+            painter.setFont(self.font())
+            painter.setPen(self.textColor())
+            left = 44 + pl if not self.icon().isNull() else pl + 16
+            painter.drawText(
+                QRectF(left, 0, self.width() - 13 - left - pr, self.height()),
+                Qt.AlignVCenter,
+                self.text(),
+            )
+
+        NavigationPushButton.paintEvent = paint_event
+        NavigationPushButton._hypomux_icon_patch = True
+
+    _patch_navigation_icon_paint()
 
     MAIN_WINDOW_TEXT = {
         "zh": {
@@ -127,6 +271,14 @@ def create_main_window():
             "log_stop_fallback_error": "[系统代理] 超时兜底清理异常: {error}",
             "log_close_cleanup_error": "[ERROR] 退出清理异常: {error}",
             "log_close_proxy_error": "[ERROR] 系统代理关闭异常: {error}",
+            "log_steam_running": "[警告] 检测到 Steam 正在运行，请重启 Steam 客户端以使多链路加速完全生效。",
+            "log_mode_changed": "[模式] 已切换为 {mode}",
+            "log_tun_config_failed": "[TUN] 生成 sing-box 配置失败: {error}",
+            "log_tun_dns_plan": "[TUN] DNS 上游: 系统自动出口 | 进程直连规则: {paths}",
+            "log_tun_pool_ready": "[TUN] 出站池 ready: {info}",
+            "log_tun_pool_failed": "[TUN] 出站池启动失败: {message}",
+            "log_tun_pool_timeout": "[TUN] 出站池启动超时，已取消虚拟网卡接管",
+            "log_diag_result": "[体检] {name} -> {status} · {loss_label} {loss}% · {jitter_label} {jitter}ms",
             "proxy_started_success": "已接管系统代理 · HTTP/HTTPS {http} · SOCKS {socks}",
         },
         "en": {
@@ -146,6 +298,14 @@ def create_main_window():
             "log_stop_fallback_error": "[System Proxy] Timeout fallback cleanup failed: {error}",
             "log_close_cleanup_error": "[ERROR] Exit cleanup failed: {error}",
             "log_close_proxy_error": "[ERROR] System proxy cleanup failed: {error}",
+            "log_steam_running": "[Warning] Steam is running. Please restart the Steam client for multi-link acceleration to take full effect.",
+            "log_mode_changed": "[Mode] Switched to {mode}",
+            "log_tun_config_failed": "[TUN] Failed to generate sing-box config: {error}",
+            "log_tun_dns_plan": "[TUN] DNS upstream: automatic system outbound | Process direct rules: {paths}",
+            "log_tun_pool_ready": "[TUN] Outbound pool ready: {info}",
+            "log_tun_pool_failed": "[TUN] Outbound pool startup failed: {message}",
+            "log_tun_pool_timeout": "[TUN] Outbound pool startup timed out; Virtual NIC takeover was cancelled",
+            "log_diag_result": "[Health] {name} -> {status} · {loss_label} {loss}% · {jitter_label} {jitter}ms",
             "proxy_started_success": "System proxy enabled · HTTP/HTTPS {http} · SOCKS {socks}",
         },
     }
@@ -167,9 +327,37 @@ def create_main_window():
                 return text
         return text
 
+    def localize_runtime_message(message: str) -> str:
+        """Translate known backend runtime messages before showing them in the UI."""
+        text = str(message)
+        if main_language() != "en":
+            return text
+
+        prefix_map = {
+            "代理内核异常退出: ": "Proxy engine exited unexpectedly: ",
+            "无法监听 ": "Failed to listen on ",
+            "多端口出站池异常退出: ": "Multi-port outbound pool exited unexpectedly: ",
+            "多端口出站池监听失败: ": "Multi-port outbound pool failed to listen: ",
+            "TUN 内核守护异常: ": "TUN kernel watchdog failed: ",
+            "sing-box 配置不存在: ": "sing-box config does not exist: ",
+            "启动 sing-box.exe 失败: ": "Failed to start sing-box.exe: ",
+            "sing-box 内核意外退出 ": "sing-box kernel exited unexpectedly ",
+        }
+        exact_map = {
+            "代理已停止": "Proxy stopped",
+            "多端口出站池已停止": "Multi-port outbound pool stopped",
+            "TUN 内核已停止": "TUN kernel stopped",
+            "未找到 bin/sing-box.exe，无法启动虚拟网卡模式": "bin/sing-box.exe was not found, cannot start Virtual NIC mode",
+        }
+        if text in exact_map:
+            return exact_map[text]
+        for zh_prefix, en_prefix in prefix_map.items():
+            if text.startswith(zh_prefix):
+                return en_prefix + text[len(zh_prefix):]
+        return text
+
     # ========== 后台扫描线程 ==========
     class ScanWorker(QThread):
-        """后台网卡扫描工作线程。"""
         scan_finished = Signal(bool, list, str)
 
         def run(self):
@@ -180,936 +368,715 @@ def create_main_window():
                 print(mw_tr("log_scan_thread_error", error=e))
                 self.scan_finished.emit(False, [], str(e))
 
-    # ========== 网卡表格组件 ==========
+    # ========== 后台诊断线程（第二阶段，原样保留）==========
+    class DiagnosticWorker(QThread):
+        result_ready = Signal(dict)
+        all_finished = Signal()
+        diag_error = Signal(str)
 
-    class NetworkAdapterTableWidget(QTableWidget):
-        """网卡列表表格组件。
+        def __init__(self, adapters, target_ip=DEFAULT_TARGET_IP, parent=None):
+            super().__init__(parent)
+            self._adapters = adapters
+            self._target_ip = target_ip
 
-        列：选择 / 网卡别名 / IPv4 地址 / 实时速度 / 实时连接数
-        其中「实时速度」和「实时连接数」由 ProxyWorker 的 traffic_signal 实时回填。
-        """
+        def run(self):
+            import asyncio as _asyncio
+            try:
+                loop = _asyncio.new_event_loop()
+                _asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self._run_all())
+                finally:
+                    loop.close()
+            except Exception as e:
+                self.diag_error.emit(str(e))
 
-        # 列索引常量，避免魔法数字散落
-        COL_CHECK = 0
-        COL_ALIAS = 1
-        COL_IPV4 = 2
-        COL_SPEED = 3
-        COL_CONN = 4
-
-        def __init__(self):
-            super().__init__()
-            # 行 -> 网卡完整信息（index/alias/ipv4 原始值）
-            self.adapter_rows: List[Dict] = []
-            self.init_ui()
-
-        def init_ui(self):
-            self.setColumnCount(5)
-            self.retranslate_ui()
-            self.verticalHeader().setVisible(False)
-            self.verticalHeader().setDefaultSectionSize(50)
-
-            header = self.horizontalHeader()
-            header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeToContents)
-            header.setSectionResizeMode(self.COL_ALIAS, QHeaderView.Stretch)
-            header.setSectionResizeMode(self.COL_IPV4, QHeaderView.Stretch)
-            header.setSectionResizeMode(self.COL_SPEED, QHeaderView.ResizeToContents)
-            header.setSectionResizeMode(self.COL_CONN, QHeaderView.ResizeToContents)
-
-            self.setShowGrid(False)
-            self.setAlternatingRowColors(False)
-            self.setSelectionBehavior(QTableWidget.SelectRows)
-            self.setSelectionMode(QAbstractItemView.NoSelection)
-            self.setFocusPolicy(Qt.NoFocus)
-            self.viewport().setFocusPolicy(Qt.NoFocus)
-            self.setStyleSheet("""
-                QTableWidget {
-                    background: #f8fafc;
-                    border: 1px solid rgba(0, 78, 140, 0.08);
-                    border-radius: 8px;
-                    padding: 4px;
-                    gridline-color: rgba(0, 78, 140, 0.05);
-                }
-                QTableWidget::viewport {
-                    background: #f8fafc;
-                }
-                QTableWidget::item {
-                    padding: 12px 8px;
-                    color: #243447;
-                    border-bottom: 1px solid rgba(0, 78, 140, 0.06);
-                }
-                QTableWidget::item:hover {
-                    background: rgba(0, 120, 212, 0.055);
-                    border-radius: 4px;
-                }
-                QTableWidget::item:selected {
-                    background: transparent;
-                    color: #243447;
-                    font-weight: 500;
-                    border-radius: 4px;
-                }
-                QTableWidget::item:focus {
-                    background: transparent;
-                    color: #243447;
-                    border-bottom: 1px solid rgba(0, 78, 140, 0.06);
-                    outline: none;
-                }
-                QHeaderView::section {
-                    background: #eef4fa;
-                    color: #526579;
-                    padding: 10px;
-                    border: none;
-                    border-bottom: 1px solid rgba(0, 78, 140, 0.10);
-                    font-weight: bold;
-                    font-size: 13px;
-                }
-                QScrollBar:vertical {
-                    background: transparent;
-                    width: 10px;
-                    margin: 8px 2px 8px 2px;
-                }
-                QScrollBar::handle:vertical {
-                    background: rgba(148, 163, 184, 120);
-                    border-radius: 5px;
-                    min-height: 24px;
-                }
-                QScrollBar::handle:vertical:hover {
-                    background: rgba(100, 116, 139, 170);
-                }
-                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                    height: 0;
-                }
-                QCheckBox {
-                    spacing: 8px;
-                    color: #334155;
-                    padding-left: 6px;
-                    background: transparent;
-                }
-                QCheckBox::indicator {
-                    width: 18px;
-                    height: 18px;
-                    border-radius: 5px;
-                    border: 1px solid #94a3b8;
-                    background: white;
-                }
-                QCheckBox::indicator:hover {
-                    border: 1px solid #3b82f6;
-                    background: #f8fbff;
-                }
-                QCheckBox::indicator:checked {
-                    border: 1px solid #0078d4;
-                    background: #0078d4;
-                    image: none;
-                }
-                QCheckBox::indicator:checked:hover {
-                    border: 1px solid #0066b3;
-                    background: #0066b3;
-                }
-            """)
-            self.setSortingEnabled(False)
-            self.setEditTriggers(QTableWidget.NoEditTriggers)
-
-        def retranslate_ui(self):
-            self.setHorizontalHeaderLabels([
-                mw_tr("col_select"),
-                mw_tr("col_alias"),
-                mw_tr("col_ipv4"),
-                mw_tr("col_speed"),
-                mw_tr("col_conn"),
-            ])
-
-        def clear_table(self):
-            self.setRowCount(0)
-            self.adapter_rows = []
-
-        @staticmethod
-        def _first_valid_ipv4(raw) -> str:
-            """从扫描结果里提取第一个有效的 IPv4 地址。
-
-            扫描返回的 ipv4 可能是：
-            - 字符串 "192.168.1.10"
-            - 逗号分隔的多 IP 字符串 "192.168.1.10, 10.0.0.5"
-            - 字符串列表 ["192.168.1.10", "10.0.0.5"]
-            统一取第一个非空、形如 a.b.c.d 的地址。
-            """
-            candidates: List[str] = []
-            if isinstance(raw, list):
-                for item in raw:
-                    candidates.extend(str(item).split(","))
-            else:
-                candidates.extend(str(raw).split(","))
-
-            for cand in candidates:
-                ip = cand.strip()
-                # 简单校验：4 段、全部为数字
-                parts = ip.split(".")
-                if len(parts) == 4 and all(p.isdigit() for p in parts):
-                    return ip
-            return ""
-
-        def add_adapter_row(self, adapter_info: Dict):
-            row = self.rowCount()
-            self.insertRow(row)
-
-            ipv4_display = adapter_info['ipv4']
-            if isinstance(ipv4_display, list):
-                ipv4_display = ', '.join(str(x) for x in ipv4_display)
-
-            # 记录该行的结构化信息，供 get_selected_adapters / 实时数据回填使用
-            self.adapter_rows.append({
-                'index': adapter_info['index'],
-                'alias': adapter_info['alias'],
-                'name': adapter_info['alias'],
-                'ipv4_raw': adapter_info['ipv4'],
-                'ip': self._first_valid_ipv4(adapter_info['ipv4']),
-            })
-
-            checkbox = QCheckBox()
-            checkbox.setStyleSheet("""
-                QCheckBox {
-                    spacing: 8px;
-                    color: #334155;
-                    padding-left: 6px;
-                    background: transparent;
-                }
-                QCheckBox::indicator {
-                    width: 18px;
-                    height: 18px;
-                    border-radius: 5px;
-                    border: 1px solid #94a3b8;
-                    background: white;
-                }
-                QCheckBox::indicator:hover {
-                    border: 1px solid #3b82f6;
-                    background: #f8fbff;
-                }
-                QCheckBox::indicator:checked {
-                    border: 1px solid #0078d4;
-                    background: #0078d4;
-                    image: none;
-                }
-                QCheckBox::indicator:checked:hover {
-                    border: 1px solid #0066b3;
-                    background: #0066b3;
-                }
-            """)
-            self.setCellWidget(row, self.COL_CHECK, checkbox)
-
-            alias_item = QTableWidgetItem(adapter_info['alias'])
-            alias_item.setFlags(alias_item.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsSelectable)
-            self.setItem(row, self.COL_ALIAS, alias_item)
-
-            ipv4_item = QTableWidgetItem(str(ipv4_display))
-            ipv4_item.setFlags(ipv4_item.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsSelectable)
-            self.setItem(row, self.COL_IPV4, ipv4_item)
-
-            speed_item = QTableWidgetItem("0.00")
-            speed_item.setFlags(speed_item.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsSelectable)
-            speed_item.setTextAlignment(Qt.AlignCenter)
-            self.setItem(row, self.COL_SPEED, speed_item)
-
-            conn_item = QTableWidgetItem("—")
-            conn_item.setFlags(conn_item.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsSelectable)
-            conn_item.setTextAlignment(Qt.AlignCenter)
-            self.setItem(row, self.COL_CONN, conn_item)
-            self.setCurrentCell(-1, -1)
-
-        def get_selected_adapters(self) -> List[Dict]:
-            """返回被勾选且拥有有效 IPv4 的网卡，供 ProxyWorker 使用。
-
-            每项形如 {'index': int, 'name': str, 'ip': str}，
-            其中 name 为网卡别名（与 psutil.net_io_counters(pernic=True) 的键一致），
-            ip 为第一个有效 IPv4（已处理逗号分隔的多 IP 情况）。
-            没有有效 IPv4 的网卡会被跳过，因为物理绑定必须有真实出口 IP。
-            """
-            selected = []
-            for row in range(self.rowCount()):
-                checkbox = self.cellWidget(row, self.COL_CHECK)
-                if checkbox and checkbox.isChecked():
-                    info = self.adapter_rows[row]
-                    if not info['ip']:
-                        continue
-                    selected.append({
-                        'index': info['index'],
-                        'name': info['alias'],
-                        'ip': info['ip'],
-                    })
-            return selected
-
-        def update_traffic(self, payload: Dict):
-            """根据 traffic_signal 快照回填每张网卡的实时速度与连接数。
-
-            payload 以网卡别名为键（含 '_total' 汇总项）。
-            """
-            for row, info in enumerate(self.adapter_rows):
-                stats = payload.get(info['alias'])
-                speed_item = self.item(row, self.COL_SPEED)
-                conn_item = self.item(row, self.COL_CONN)
-                if stats is None:
-                    if speed_item is not None:
-                        speed_item.setText("0.00")
-                    if conn_item is not None:
-                        conn_item.setText("—")
-                else:
-                    if speed_item is not None:
-                        speed_item.setText(f"{stats.get('down_mbps', 0.0):.2f}")
-                    if conn_item is not None:
-                        conn_item.setText(str(stats.get('connections', 0)))
-
-        def reset_traffic(self):
-            """停止加速后，把实时速度和连接数列清零显示。"""
-            for row in range(self.rowCount()):
-                speed_item = self.item(row, self.COL_SPEED)
-                conn_item = self.item(row, self.COL_CONN)
-                if speed_item is not None:
-                    speed_item.setText("0.00")
-                if conn_item is not None:
-                    conn_item.setText("—")
-
-        def select_all(self):
-            for row in range(self.rowCount()):
-                checkbox = self.cellWidget(row, self.COL_CHECK)
-                if checkbox:
-                    checkbox.setChecked(True)
-
-        def deselect_all(self):
-            for row in range(self.rowCount()):
-                checkbox = self.cellWidget(row, self.COL_CHECK)
-                if checkbox:
-                    checkbox.setChecked(False)
-
-        def set_checkboxes_enabled(self, enabled: bool):
-            """加速运行期间禁止改动网卡勾选，避免调度集合中途变化。"""
-            for row in range(self.rowCount()):
-                checkbox = self.cellWidget(row, self.COL_CHECK)
-                if checkbox:
-                    checkbox.setEnabled(enabled)
+        async def _run_all(self):
+            for nic in self._adapters:
+                try:
+                    result = await run_diagnostic(nic.get("ip", ""), self._target_ip)
+                except Exception as e:
+                    result = {
+                        "status": "unavailable", "loss_rate": 100,
+                        "avg_latency_ms": 0, "jitter_ms": 0,
+                        "src_ip": nic.get("ip", ""), "note": str(e),
+                    }
+                result["name"] = nic.get("name", nic.get("ip", ""))
+                result["ip"] = nic.get("ip", "")
+                self.result_ready.emit(result)
+            self.all_finished.emit()
 
     # ========== 主窗口 ==========
-    class MainWindow(QMainWindow):
-        """HypoMux 主窗口"""
+    class MainWindow(FluentWindow):
+        """HypoMux 主窗口（FluentWindow 侧边导航）"""
+
         def __init__(self):
             set_system_proxy(False)
             super().__init__()
-            self.setWindowTitle(mw_tr("window_title"))
-            self.setWindowIcon(QIcon())
-            self.setFixedSize(1280, 820)
-            self.setAttribute(Qt.WA_TranslucentBackground, True)
-            self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
-            self._drag_pos = None
 
-            # 扫描线程
+            # ===== 配置与运行状态 =====
+            self._app_config = load_config()
+            self._adapters: List[Dict] = []           # 扫描得到的网卡原始列表
+            self._checked_aliases = set(self._app_config.get("selected_adapters", []))
+
             self.scan_worker = ScanWorker()
-            # 当前运行中的代理引擎（None 表示未启动）
+            self.diag_worker = None
             self.proxy_worker = None
             self._is_boosting = False
             self._pending_socks_addr = ""
             self._pending_http_addr = ""
-            self._status_key = "status_loading"
-            self._status_kwargs = {}
             self._retired_proxy_workers = []
+            self._last_up_mbps = 0.0
+            self._last_conn_count = 0
+
+            # 任务1/3：运行模式与多端口出站池 / TUN 内核
+            self._run_mode = self._app_config.get("run_mode", "proxy")
+            self._routing_rules = self._app_config.get("routing_rules", [])
+            self._pool_worker = None      # MultiPortProxyWorker（TUN 模式下的出站池）
+            self._tun_manager = None      # sing-box 内核侧车
+            self._tun_active = False
+            self._tun_starting = False
+            self._shutdown_started = False
+            self._force_exit = False
+            self._engine_transitioning = False
+
             self._stop_fallback_timer = QTimer(self)
             self._stop_fallback_timer.setSingleShot(True)
             self._stop_fallback_timer.timeout.connect(self._force_finish_stop_ui)
-
-            # 系统托盘初始化
-            self._init_system_tray()
-
-            self.connect_worker_signals()
-            self.init_ui()
-            self.load_adapters()
-
-        def connect_worker_signals(self):
-            self.scan_worker.scan_finished.connect(self.on_scan_finished)
-
-        def _init_system_tray(self):
-            """初始化系统托盘图标和右键菜单"""
-            import os
-            self.tray_icon = QSystemTrayIcon(self)
-
-            # 加载托盘图标（优先项目 icon，回退到默认）
-            icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icon.ico")
-            if os.path.exists(icon_path):
-                self.tray_icon.setIcon(QIcon(icon_path))
-            else:
-                # 回退到应用窗口图标
-                self.tray_icon.setIcon(self.windowIcon())
-
-            self.tray_icon.setToolTip(mw_tr("tray_tooltip"))
-
-            # 创建托盘右键菜单
-            tray_menu = QMenu()
-            tray_menu.setStyleSheet("""
-                QMenu {
-                    background: white;
-                    border: 1px solid #d0d0d0;
-                    border-radius: 6px;
-                    padding: 4px;
-                }
-                QMenu::item {
-                    padding: 8px 24px 8px 12px;
-                    border-radius: 4px;
-                    color: #1a1a1a;
-                }
-                QMenu::item:selected {
-                    background: #e6f3ff;
-                    color: #0078d4;
-                }
-            """)
-
-            # 显示主界面
-            show_action = QAction(mw_tr("tray_show_main"), self)
-            show_action.triggered.connect(self._show_from_tray)
-            tray_menu.addAction(show_action)
-
-            tray_menu.addSeparator()
-
-            # 退出程序
-            exit_action = QAction(mw_tr("tray_exit"), self)
-            exit_action.triggered.connect(self._exit_from_tray)
-            tray_menu.addAction(exit_action)
-
-            self.tray_icon.setContextMenu(tray_menu)
-            # 双击托盘图标也显示主界面
-            self.tray_icon.activated.connect(self._on_tray_activated)
-
-            # 显示托盘图标
-            self.tray_icon.show()
-
-        def _on_tray_activated(self, reason):
-            """托盘图标被激活（双击）"""
-            if reason == QSystemTrayIcon.DoubleClick:
-                self._show_from_tray()
-
-        def _show_from_tray(self):
-            """从系统托盘恢复显示主窗口"""
-            self.show()
-            self.activateWindow()
-            self.raise_()
-
-        def _exit_from_tray(self):
-            """从系统托盘彻底退出程序（绕过托盘逻辑）"""
-            # 临时设置为直接退出，避免 closeEvent 再次隐藏窗口
-            settings = QSettings("Hypostasis-Cat", "HypoMux")
-            original_behavior = settings.value("close_behavior", "tray", type=str)
-            settings.setValue("close_behavior", "exit")
-
-            # 执行关闭（这次会走彻底退出逻辑）
-            self.close()
-
-            # 恢复原设置（虽然进程即将退出，但保持状态一致性）
-            settings.setValue("close_behavior", original_behavior)
-
-        def init_ui(self):
-            self.setStyleSheet("background: transparent;")
-
-            central_widget = QWidget()
-            central_widget.setStyleSheet("background: transparent;")
-            self.setCentralWidget(central_widget)
-
-            root_layout = QVBoxLayout(central_widget)
-            root_layout.setContentsMargins(0, 0, 0, 0)
-            root_layout.setSpacing(0)
-
-            shell = QFrame()
-            shell.setObjectName("shellCard")
-            shell_layout = QVBoxLayout(shell)
-            shell_layout.setContentsMargins(20, 20, 20, 20)
-            shell_layout.setSpacing(14)
-
-            shell.setStyleSheet("""
-                QFrame#shellCard {
-                    background: #f7fbff;
-                    border: 1px solid rgba(0, 0, 0, 0.08);
-                    border-radius: 12px;
-                }
-                QLabel#pageTitle {
-                    color: #1a1a1a;
-                    font-weight: 700;
-                }
-                QLabel#pageSubtitle {
-                    color: #5f5f5f;
-                }
-                QLabel#statusBadge {
-                    background: #e7f2fd;
-                    color: #0066b3;
-                    border: 1px solid rgba(0, 102, 179, 0.14);
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                    font-weight: 600;
-                }
-                QLineEdit, QSpinBox, QComboBox {
-                    background: #ffffff;
-                    border: 1px solid rgba(0, 0, 0, 0.10);
-                    border-radius: 8px;
-                    padding: 8px 10px;
-                    color: #1a1a1a;
-                }
-                QSpinBox {
-                    padding-right: 10px;
-                }
-                QSpinBox::up-button, QSpinBox::down-button {
-                    width: 0;
-                    height: 0;
-                    border: none;
-                    background: transparent;
-                }
-                QSpinBox::up-arrow, QSpinBox::down-arrow {
-                    width: 0;
-                    height: 0;
-                    image: none;
-                }
-                QCheckBox {
-                    spacing: 8px;
-                    color: #2d2d2d;
-                }
-            """)
-
-            # ---------- 标题栏 ----------
-            title_bar = QHBoxLayout()
-            title_bar.setContentsMargins(0, 0, 0, 0)
-            title_bar.setSpacing(8)
-
-            title_box = QVBoxLayout()
-            title_box.setSpacing(4)
-
-            self.refresh_btn = QToolButton()
-            self.refresh_btn.setText("↻")
-            self.refresh_btn.setFixedSize(36, 32)
-            self.refresh_btn.setStyleSheet(self._tool_btn_style())
-            self.refresh_btn.clicked.connect(self.load_adapters)
-
-            self.min_btn = QToolButton()
-            self.min_btn.setText("—")
-            self.min_btn.setFixedSize(36, 32)
-            self.min_btn.setStyleSheet(self._tool_btn_style())
-            self.min_btn.clicked.connect(self.showMinimized)
-
-            self.close_btn = QToolButton()
-            self.close_btn.setText("×")
-            self.close_btn.setFixedSize(36, 32)
-            self.close_btn.setStyleSheet(self._tool_btn_style(danger=True))
-            self.close_btn.clicked.connect(self.close)
-
-            self.settings_btn = QToolButton()
-            self.settings_btn.setText(mw_tr("settings_btn"))
-            self.settings_btn.setFixedHeight(32)
-            self.settings_btn.setMinimumWidth(52)
-            self.settings_btn.setStyleSheet("""
-                QToolButton {
-                    background: rgba(255, 255, 255, 220);
-                    color: #0078d4;
-                    border: 1px solid rgba(0, 120, 212, 0.18);
-                    border-radius: 10px;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
-                QToolButton:hover {
-                    background: rgba(239, 246, 255, 240);
-                    border: 1px solid rgba(0, 120, 212, 0.35);
-                }
-            """)
-            self.settings_btn.clicked.connect(self._open_settings)
-
-            title_label = QLabel("HypoMux")
-            title_label.setObjectName("pageTitle")
-            title_font = QFont()
-            title_font.setPointSize(22)
-            title_font.setBold(True)
-            title_label.setFont(title_font)
-
-            self.subtitle_label = QLabel("")
-            self.subtitle_label.setObjectName("pageSubtitle")
-            subtitle_font = QFont()
-            subtitle_font.setPointSize(10)
-            self.subtitle_label.setFont(subtitle_font)
-
-            title_box.addWidget(title_label)
-            title_box.addWidget(self.subtitle_label)
-
-            self.status_label = QLabel(mw_tr("status_loading"))
-            self.status_label.setObjectName("statusBadge")
-            self.status_label.setAlignment(Qt.AlignCenter)
-
-            title_bar.addLayout(title_box)
-            title_bar.addStretch()
-            title_bar.addWidget(self.status_label)
-            title_bar.addWidget(self.settings_btn)
-            title_bar.addWidget(self.refresh_btn)
-            title_bar.addWidget(self.min_btn)
-            title_bar.addWidget(self.close_btn)
-            shell_layout.addLayout(title_bar)
-
-            # ---------- 数据大屏：合并下行总速度 ----------
-            dashboard = QFrame()
-            dashboard.setStyleSheet("""
-                QFrame {
-                    background: #f8fafc;
-                    border: 1px solid rgba(0, 78, 140, 0.08);
-                    border-radius: 6px;
-                }
-            """)
-            dash_layout = QHBoxLayout(dashboard)
-            dash_layout.setContentsMargins(20, 14, 20, 14)
-            dash_layout.setSpacing(24)
-
-            self.speed_value_label = QLabel("0.00")
-            speed_font = QFont()
-            speed_font.setPointSize(30)
-            speed_font.setBold(True)
-            self.speed_value_label.setFont(speed_font)
-            self.speed_value_label.setStyleSheet("color: #0066b3;")
-
-            self.speed_caption = QLabel("")
-            self.speed_caption.setStyleSheet("color: #616161; font-weight: 600;")
-
-            speed_box = QVBoxLayout()
-            speed_box.setSpacing(2)
-            speed_box.addWidget(self.speed_value_label)
-            speed_box.addWidget(self.speed_caption)
-
-            self.up_value_label = QLabel(mw_tr("up_format", value=0.0))
-            self.up_value_label.setStyleSheet("color: #616161; font-weight: 600;")
-            self.conn_value_label = QLabel(mw_tr("conn_format", value=0))
-            self.conn_value_label.setStyleSheet("color: #616161; font-weight: 600;")
-
-            meta_box = QVBoxLayout()
-            meta_box.setSpacing(6)
-            meta_box.addStretch()
-            meta_box.addWidget(self.up_value_label)
-            meta_box.addWidget(self.conn_value_label)
-            meta_box.addStretch()
-
-            dash_layout.addLayout(speed_box)
-            dash_layout.addStretch()
-            dash_layout.addLayout(meta_box)
-            shell_layout.addWidget(dashboard)
-
-            # ---------- 网卡表格 ----------
-            self.table_widget = NetworkAdapterTableWidget()
-            shell_layout.addWidget(self.table_widget, stretch=3)
-
-
-            # ---------- 实时控制台 ----------
-            self.console_caption = QLabel("")
-            self.console_caption.setStyleSheet("color: #526579; font-weight: 600;")
-            shell_layout.addWidget(self.console_caption)
-
-            self.console = QPlainTextEdit()
-            self.console.setReadOnly(True)
-            self.console.setMaximumBlockCount(500)  # 限制行数，避免长时间运行内存膨胀
-            self.console.setStyleSheet("""
-                QPlainTextEdit {
-                    background: #f8fafc;
-                    color: #334155;
-                    border: 1px solid rgba(0, 78, 140, 0.08);
-                    border-radius: 6px;
-                    padding: 10px;
-                    font-family: 'Consolas', 'Segoe UI Mono', monospace;
-                    font-size: 12px;
-                }
-                QPlainTextEdit QScrollBar:vertical {
-                    background: transparent;
-                    width: 10px;
-                    margin: 8px 3px 8px 0;
-                    border: none;
-                }
-                QPlainTextEdit QScrollBar::handle:vertical {
-                    background: rgba(100, 116, 139, 0.38);
-                    border-radius: 5px;
-                    min-height: 28px;
-                }
-                QPlainTextEdit QScrollBar::handle:vertical:hover {
-                    background: rgba(71, 85, 105, 0.55);
-                }
-                QPlainTextEdit QScrollBar::add-line:vertical,
-                QPlainTextEdit QScrollBar::sub-line:vertical {
-                    height: 0;
-                    width: 0;
-                    border: none;
-                    background: transparent;
-                }
-                QPlainTextEdit QScrollBar::add-page:vertical,
-                QPlainTextEdit QScrollBar::sub-page:vertical {
-                    background: transparent;
-                }
-                QPlainTextEdit QScrollBar:horizontal {
-                    background: transparent;
-                    height: 10px;
-                    margin: 0 8px 3px 8px;
-                    border: none;
-                }
-                QPlainTextEdit QScrollBar::handle:horizontal {
-                    background: rgba(100, 116, 139, 0.32);
-                    border-radius: 5px;
-                    min-width: 28px;
-                }
-                QPlainTextEdit QScrollBar::add-line:horizontal,
-                QPlainTextEdit QScrollBar::sub-line:horizontal {
-                    width: 0;
-                    height: 0;
-                    border: none;
-                    background: transparent;
-                }
-                QPlainTextEdit QScrollBar::add-page:horizontal,
-                QPlainTextEdit QScrollBar::sub-page:horizontal {
-                    background: transparent;
-                }
-            """)
-            shell_layout.addWidget(self.console, stretch=2)
-
-            # ---------- 操作栏 ----------
-            action_layout = QHBoxLayout()
-            action_layout.setSpacing(12)
-
-            self.select_all_btn = PushButton(mw_tr("select_all"))
-            self.select_all_btn.setMinimumHeight(42)
-            self.select_all_btn.setMaximumWidth(100)
-            self.select_all_btn.clicked.connect(self.on_select_all_clicked)
-
-            self.deselect_all_btn = PushButton(mw_tr("deselect_all"))
-            self.deselect_all_btn.setMinimumHeight(42)
-            self.deselect_all_btn.setMaximumWidth(100)
-            self.deselect_all_btn.clicked.connect(self.on_deselect_all_clicked)
-
-            self.port_label = QLabel("")
-            self.port_label.setStyleSheet("color: #526579; font-weight: 600;")
-            self.port_spinbox = QSpinBox()
-            self.port_spinbox.setMinimum(1)
-            self.port_spinbox.setMaximum(65534)
-            self.port_spinbox.setValue(DEFAULT_SOCKS_PORT)
-            self.port_spinbox.setMinimumWidth(110)
-            self.port_spinbox.setButtonSymbols(QSpinBox.NoButtons)
-
-            self.boost_btn = PrimaryPushButton(mw_tr("boost_start"))
-            self.boost_btn.setMinimumHeight(42)
-            self.boost_btn.setMinimumWidth(118)
-            self.boost_btn.setMaximumWidth(140)
-            self.boost_btn.clicked.connect(self.on_boost_clicked)
-            self.boost_btn.setEnabled(False)
-            self._apply_boost_button_style(active=False)
-
-            action_layout.addWidget(self.select_all_btn)
-            action_layout.addWidget(self.deselect_all_btn)
-            action_layout.addStretch()
-            action_layout.addWidget(self.port_label)
-            action_layout.addWidget(self.port_spinbox)
-            action_layout.addWidget(self.boost_btn)
-
-            shell_layout.addLayout(action_layout)
-
-            # ========== QStackedWidget 翻页容器 ==========
-            self.stacked_widget = SlidingStackedWidget()
-            self.stacked_widget.addWidget(shell)  # Index 0: 主大屏
-
-            # ---------- Index 1: 设置面板（独立模块） ----------
-            self.settings_widget = SettingsWidget()
-            self.settings_widget.back_clicked.connect(self._back_to_dashboard)
-            self.settings_widget.info_message.connect(self.show_info)
-            self.settings_widget.success_message.connect(self.show_success)
-            self.settings_widget.warning_message.connect(self.show_warning)
-            self.settings_widget.ports_changed.connect(self._on_settings_ports_changed)
-            self.settings_widget.language_changed.connect(self._on_language_changed)
-            self.stacked_widget.addWidget(self.settings_widget)  # Index 1
-
-            self.stacked_widget.setCurrentIndex(0)
-            root_layout.addWidget(self.stacked_widget)
+            self._tun_pool_start_timer = QTimer(self)
+            self._tun_pool_start_timer.setSingleShot(True)
+            self._tun_pool_start_timer.timeout.connect(self._on_tun_pool_start_timeout)
 
             self._InfoBar = InfoBar
             self._InfoBarPosition = InfoBarPosition
             self._Qt = Qt
-            self.retranslate_ui()
 
-        # ---------- 样式辅助 ----------
-        def _apply_boost_button_style(self, active: bool = False):
-            """Keep the boost button visually consistent across start/stop states."""
-            if active:
-                normal_bg = "#d13438"
-                hover_bg = "#c42b1c"
-                pressed_bg = "#a4262c"
-                border = "#b3262d"
-            else:
-                normal_bg = "#0078d4"
-                hover_bg = "#106ebe"
-                pressed_bg = "#005a9e"
-                border = "#006cbe"
+            # ===== 窗口外观 =====
+            self.setWindowTitle("HypoMux")
+            self.apply_standard_geometry()
 
-            self.boost_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {normal_bg};
-                    color: white;
-                    border: 1px solid {border};
-                    border-radius: 8px;
-                    padding: 0 18px;
-                    font-size: 13px;
-                    font-weight: 600;
-                }}
-                QPushButton:hover {{
-                    background: {hover_bg};
-                    border: 1px solid {hover_bg};
-                }}
-                QPushButton:pressed {{
-                    background: {pressed_bg};
-                    border: 1px solid {pressed_bg};
-                    padding-top: 1px;
-                }}
-                QPushButton:disabled {{
-                    background: #eef2f7;
-                    color: #94a3b8;
-                    border: 1px solid #d7dee8;
-                }}
-            """)
+            # 任务1：开启 Windows 11 原生 Mica/云母毛玻璃材质。
+            # 不硬编码窗口背景 QSS，使浅色/深色模式均呈现高阶半透明质感。
+            try:
+                self.setMicaEffectEnabled(True)
+            except Exception:
+                pass
 
-        def _tool_btn_style(self, danger: bool = False) -> str:
-            hover = (
-                "background: rgba(254, 242, 242, 240);"
-                "border: 1px solid rgba(248, 113, 113, 220);"
-                "color: #b91c1c;"
-                if danger else
-                "background: rgba(239, 246, 255, 240);"
-                "border: 1px solid rgba(191, 219, 254, 240);"
+            # ===== 构建页面与导航 =====
+            self._init_pages()
+            self._init_navigation()
+            self._refine_navigation_appearance()
+            self._connect_page_signals()
+
+            # ===== 系统托盘 =====
+            self._init_system_tray()
+
+            # ===== 后端信号 =====
+            self.scan_worker.scan_finished.connect(self.on_scan_finished)
+
+            # 任务4：监听主题切换，重绘高亮控件，根治深浅切换后蓝字坍塌为黑字
+            try:
+                qconfig.themeChanged.connect(self._on_theme_changed)
+            except Exception:
+                pass
+
+            # ===== 启动扫描 =====
+            self.load_adapters()
+            self._sync_engine_ports()
+
+        def _on_theme_changed(self, *args):
+            """主题切换回调：延迟重绘高亮控件，避免取到旧主题色。"""
+            self._refresh_theme_sensitive_pages()
+            QTimer.singleShot(80, self._refresh_theme_sensitive_pages)
+
+        def _refresh_theme_sensitive_pages(self):
+            for page in (
+                self.home_page,
+                self.routing_page,
+                self.tools_page,
+                self.settings_page,
+                self.about_page,
+            ):
+                refresh = getattr(page, "refresh_theme", None)
+                if callable(refresh):
+                    try:
+                        refresh()
+                    except Exception:
+                        pass
+
+        def apply_standard_geometry(self):
+            """统一窗口标准尺寸，避免开机会话 DPI 初始化阶段尺寸漂移。"""
+            self.setMinimumSize(960, 680)
+            self.resize(1120, 800)
+
+        # ---------- 页面与导航 ----------
+        def _init_pages(self):
+            self.home_page = HomePage(self)
+            self.routing_page = RoutingPage(self)
+            self.tools_page = ToolsPage(self)
+            self.settings_page = SettingsPage(self)
+            self.about_page = AboutPage(self)
+
+        def _init_navigation(self):
+            # 图标方案（用户确认）：HOME / GLOBAL(回退 GLOBE/IOT) / SPEED_HIGH / SETTING
+            self.addSubInterface(
+                self.home_page, FluentIcon.HOME, tr("nav_home")
             )
-            return f"""
-                QToolButton {{
-                    background: rgba(255, 255, 255, 220);
-                    color: #334155;
-                    border: 1px solid rgba(226, 232, 240, 220);
-                    border-radius: 10px;
-                    font-size: 18px;
-                    font-weight: 600;
-                }}
-                QToolButton:hover {{ {hover} }}
-            """
+            self.addSubInterface(
+                self.routing_page, resolve_icon("GLOBAL", "GLOBE", "IOT"), tr("nav_routing")
+            )
+            self.addSubInterface(
+                self.tools_page, FluentIcon.SPEED_HIGH, tr("nav_tools")
+            )
+            # 任务3：系统设置挪到顶部主功能组（移除 BOTTOM）
+            self.addSubInterface(
+                self.settings_page, FluentIcon.SETTING, tr("nav_settings")
+            )
+            # 关于页归入主业务导航流，保持左下角视觉清爽
+            self.addSubInterface(
+                self.about_page, FluentIcon.INFO, tr("nav_about")
+            )
 
-        # ---------- 设置面板交互逻辑 ----------
-        def _open_settings(self):
-            """切换到设置页面"""
-            self.stacked_widget.slide_to_index(1)
+        def _refine_navigation_appearance(self):
+            """Refine the Fluent navigation bar without forcing a broken expanded state."""
+            # 1) 砍掉左上角鸡肋的返回按钮
+            try:
+                self.navigationInterface.setReturnButtonVisible(False)
+            except Exception:
+                pass
+            # 兼容部分版本提供的窗口级开关
+            try:
+                self.setBackButtonVisible(False)
+            except Exception:
+                pass
 
-        def _back_to_dashboard(self):
-            """切回主大屏"""
-            self.stacked_widget.slide_to_index(0)
+            # Keep collapse/expand behavior native, but make the expanded rail less wide.
+            try:
+                self.navigationInterface.setExpandWidth(220)
+            except Exception:
+                pass
 
-        def _on_settings_ports_changed(self, socks_port: int, http_port: int):
-            """设置面板端口变更后同步到主界面操作栏"""
-            self.port_spinbox.setValue(socks_port)
+            nav_font = QFont("Microsoft YaHei", 12)
+            nav_font.setWeight(QFont.Normal)
+            try:
+                self.navigationInterface.setFont(nav_font)
+                for btn in self.navigationInterface.findChildren(QWidget):
+                    try:
+                        btn.setFont(nav_font)
+                    except Exception:
+                        pass
+                    class_name = btn.metaObject().className()
+                    if "Navigation" not in class_name:
+                        continue
+            except Exception:
+                pass
 
+        def _connect_page_signals(self):
+            # 首页
+            self.home_page.engine_toggled.connect(self.on_engine_toggled)
+            self.home_page.select_all_clicked.connect(self.on_select_all_clicked)
+            self.home_page.deselect_all_clicked.connect(self.on_deselect_all_clicked)
+            self.home_page.refresh_clicked.connect(self.load_adapters)
+            self.home_page.adapter_checked.connect(self.on_adapter_checked)
+            self.home_page.mode_changed.connect(self.on_mode_changed)
+            # 工具页（任务2：体检页也能勾选网卡，并入选择流）
+            self.tools_page.start_clicked.connect(self.on_diagnose_clicked)
+            self.tools_page.adapter_checked.connect(self.on_adapter_checked)
+            self.tools_page.refresh_clicked.connect(self.load_adapters)
+            # 路由页（任务2：规则变更即持久化）
+            self.routing_page.rules_changed.connect(self.on_routing_rules_changed)
+            # 设置页
+            self.settings_page.language_changed.connect(self._on_language_changed)
+            self.settings_page.ports_changed.connect(self._on_settings_ports_changed)
+            self.settings_page.info_message.connect(self.show_info)
+            self.settings_page.success_message.connect(self.show_success)
+            self.settings_page.warning_message.connect(self.show_warning)
+            self.settings_page.dns_changed.connect(self._on_dns_changed)
+
+            # 启动恢复：运行模式分段控件 + 路由规则表
+            try:
+                self.home_page.set_mode(self._run_mode)
+                self.routing_page.load_rules(self._routing_rules)
+            except Exception:
+                pass
+
+        # ---------- 系统托盘 ----------
+        def _init_system_tray(self):
+            import os
+            self.tray_icon = QSystemTrayIcon(self)
+            icon_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "assets", "icon.ico"
+            )
+            if os.path.exists(icon_path):
+                self.tray_icon.setIcon(QIcon(icon_path))
+            else:
+                self.tray_icon.setIcon(self.windowIcon())
+            self.tray_icon.setToolTip(tr("tray_tooltip"))
+
+            tray_menu = QMenu()
+            show_action = QAction(tr("tray_show_main"), self)
+            show_action.triggered.connect(self._show_from_tray)
+            tray_menu.addAction(show_action)
+            tray_menu.addSeparator()
+            exit_action = QAction(tr("tray_exit"), self)
+            exit_action.triggered.connect(self._exit_from_tray)
+            tray_menu.addAction(exit_action)
+
+            self.tray_icon.setContextMenu(tray_menu)
+            self.tray_icon.activated.connect(self._on_tray_activated)
+            self.tray_icon.show()
+
+        def _on_tray_activated(self, reason):
+            if reason == QSystemTrayIcon.DoubleClick:
+                self._show_from_tray()
+
+        def _show_from_tray(self):
+            self.apply_standard_geometry()
+            self.show()
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+            self.activateWindow()
+            self.raise_()
+
+        def _exit_from_tray(self):
+            self._force_exit = True
+            try:
+                self.shutdown_backend_workers()
+            finally:
+                if hasattr(self, "tray_icon"):
+                    self.tray_icon.hide()
+                self.close()
+                QApplication.quit()
+
+        # ---------- 国际化刷新 ----------
         def _on_language_changed(self, lang_code: str):
             settings = QSettings("Hypostasis-Cat", "HypoMux")
             settings.setValue("ui/language", lang_code)
             settings.setValue("language", lang_code)
             settings.sync()
-            self.retranslate_ui()
+            self.setWindowTitle("HypoMux")
+            self.home_page.retranslate_ui()
+            self.routing_page.retranslate_ui()
+            self.tools_page.retranslate_ui()
+            self.settings_page.retranslate_ui()
+            self.about_page.retranslate_ui()
+            self.tray_icon.setToolTip(tr("tray_tooltip"))
 
-        def _set_status(self, key: str, **kwargs):
-            self._status_key = key
-            self._status_kwargs = dict(kwargs)
-            self.status_label.setText(mw_tr(key, **kwargs))
+        # ---------- 端口同步 ----------
+        def _sync_engine_ports(self):
+            socks = int(self._app_config.get("socks_port", DEFAULT_SOCKS_PORT))
+            http = int(self._app_config.get("http_port", socks + 1))
+            self.home_page.set_engine_state(self._is_boosting, socks, http)
 
-        def retranslate_ui(self):
-            self.setWindowTitle(mw_tr("window_title"))
-            self.subtitle_label.setText(mw_tr("subtitle"))
-            self.settings_btn.setText(mw_tr("settings_btn"))
-            self.table_widget.retranslate_ui()
-            self.speed_caption.setText(mw_tr("speed_caption"))
-            self.console_caption.setText(mw_tr("console_caption"))
-            self.select_all_btn.setText(mw_tr("select_all"))
-            self.deselect_all_btn.setText(mw_tr("deselect_all"))
-            self.port_label.setText(mw_tr("port_label"))
-            self.boost_btn.setText(mw_tr("boost_stop" if self._is_boosting else "boost_start"))
-            self.up_value_label.setText(mw_tr("up_format", value=getattr(self, "_last_up_mbps", 0.0)))
-            self.conn_value_label.setText(mw_tr("conn_format", value=getattr(self, "_last_conn_count", 0)))
-            self.status_label.setText(mw_tr(self._status_key, **self._status_kwargs))
-            if hasattr(self, "settings_widget"):
-                self.settings_widget.retranslate_ui()
+        def _on_settings_ports_changed(self, socks_port: int, http_port: int):
+            self._app_config["socks_port"] = socks_port
+            self._app_config["http_port"] = http_port
+            self._persist_config()
+            self._sync_engine_ports()
 
-        def mousePressEvent(self, event):
-            if event.button() == Qt.LeftButton:
-                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                event.accept()
+        def _on_dns_changed(self, dns_server: str, doh_provider: str = "auto"):
+            self._app_config["dns_server"] = dns_server
+            self._app_config["doh_provider"] = doh_provider
+            self._persist_config()
+            if self._tun_active:
+                self._regenerate_singbox_config()
+
+        # ========== 配置持久化 ==========
+        def _collect_config(self) -> dict:
+            socks = int(self._app_config.get("socks_port", DEFAULT_SOCKS_PORT))
+            return {
+                "selected_adapters": sorted(self._checked_aliases),
+                "socks_port": socks,
+                "http_port": socks + 1,
+                "run_mode": self._run_mode,
+                "routing_rules": self._routing_rules,
+                "dns_server": self._app_config.get("dns_server", "223.5.5.5"),
+                "doh_provider": self._app_config.get("doh_provider", "auto"),
+            }
+
+        def _persist_config(self):
+            try:
+                self._app_config = self._collect_config()
+                save_config(self._app_config)
+            except Exception as e:
+                print(f"[WARN] Failed to save config: {e}")
+
+        def on_adapter_checked(self, alias: str, checked: bool):
+            if checked:
+                self._checked_aliases.add(alias)
             else:
-                super().mousePressEvent(event)
+                self._checked_aliases.discard(alias)
+            # 任务2：跨屏双向同步——首页与体检页勾选状态实时一致
+            self.home_page.set_card_checked(alias, checked)
+            self.tools_page.set_card_checked(alias, checked)
+            self._persist_config()
 
-        def mouseMoveEvent(self, event):
-            if event.buttons() & Qt.LeftButton and self._drag_pos is not None:
-                self.move(event.globalPosition().toPoint() - self._drag_pos)
-                event.accept()
-            else:
-                super().mouseMoveEvent(event)
+        def on_select_all_clicked(self):
+            self._checked_aliases = {a["alias"] for a in self._adapters}
+            self.home_page.set_all_checked(True)
+            self.tools_page.set_all_checked(True)
+            self._persist_config()
 
-        def mouseReleaseEvent(self, event):
-            self._drag_pos = None
-            super().mouseReleaseEvent(event)
+        def on_deselect_all_clicked(self):
+            self._checked_aliases.clear()
+            self.home_page.set_all_checked(False)
+            self.tools_page.set_all_checked(False)
+            self._persist_config()
 
-        def resizeEvent(self, event):
-            super().resizeEvent(event)
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(self.rect()), 12, 12)
-            self.setMask(QRegion(path.toFillPolygon().toPolygon()))
-
-        # ========== 控制台日志 ==========
-        def append_log(self, message: str):
-            self.console.appendPlainText(message)
+        # ========== 选中网卡解析（供 ProxyWorker / 诊断使用）==========
+        def get_selected_adapters(self) -> List[Dict]:
+            """返回被勾选且拥有有效 IPv4 的网卡，保留出站池所需的类型元数据。"""
+            selected = []
+            for a in self._adapters:
+                if a["alias"] not in self._checked_aliases:
+                    continue
+                ip = _first_valid_ipv4(a.get("ipv4", ""))
+                if not ip:
+                    continue
+                selected.append({
+                    "index": a["index"],
+                    "name": a["alias"],
+                    "ip": ip,
+                    "dns_servers": a.get("dns_servers", []),
+                    "iftype": a.get("iftype", -1),
+                    "is_ppp": bool(a.get("is_ppp", False)),
+                    "metric": a.get("metric", -1),
+                })
+            return selected
 
         # ========== 网卡扫描 ==========
         def load_adapters(self):
-            # 加速运行期间禁止刷新网卡，避免抽掉正在分流的网卡
             if self._is_boosting:
-                self.show_warning(mw_tr("warn_boosting_refresh"))
+                self.show_warning(tr("warn_boosting_refresh"))
                 return
-
-            self.table_widget.clear_table()
-            self._set_status("status_loading")
-            self.boost_btn.setEnabled(False)
-            self.refresh_btn.setEnabled(False)
-
+            self.home_page.refresh_btn.setEnabled(False)
             if self.scan_worker.isRunning():
                 self.scan_worker.wait()
-
             self.scan_worker.start()
 
         @Slot(bool, list, str)
         def on_scan_finished(self, success: bool, adapters: list, error_msg: str):
-            if success:
-                if not adapters:
-                    self._set_status("status_no_adapters")
-                    self.show_warning(mw_tr("warn_no_adapters"))
-                else:
-                    for adapter in adapters:
-                        self.table_widget.add_adapter_row(adapter)
-                    self._set_status("status_loaded", count=len(adapters))
-                    self.boost_btn.setEnabled(True)
-                self.refresh_btn.setEnabled(True)
+            self.home_page.refresh_btn.setEnabled(True)
+            if not success:
+                self.show_error(tr("error_load_adapters", error=error_msg))
+                return
+            if not adapters:
+                self.show_warning(tr("warn_no_adapters"))
+
+            self._adapters = adapters
+            # 预先为每张网卡补一个 'ip' 字段（首个有效 IPv4），供卡片显示
+            for a in self._adapters:
+                a["ip"] = _first_valid_ipv4(a.get("ipv4", ""))
+            # 仅保留仍存在的勾选别名
+            existing = {a["alias"] for a in self._adapters}
+            self._checked_aliases &= existing
+            # 任务2：首页 + 体检页同步重建网卡卡片（同一份数据 + 勾选态）
+            self.home_page.rebuild_cards(self._adapters, sorted(self._checked_aliases))
+            self.tools_page.rebuild_cards(self._adapters, sorted(self._checked_aliases))
+            self.routing_page.set_available_adapters(self._adapters)
+
+        # ========== 引擎开关（首页 SwitchButton）==========
+        def on_engine_toggled(self, checked: bool):
+            if self._engine_transitioning:
+                self._sync_engine_ports()
+                return
+            if self._run_mode == "tun":
+                already_running = self._tun_active or self._tun_starting
             else:
-                self._set_status("status_load_failed")
-                self.refresh_btn.setEnabled(True)
-                self.show_error(mw_tr("error_load_adapters", error=error_msg))
+                already_running = self._is_boosting or self.proxy_worker is not None
+            if checked == already_running:
+                return
+            self._engine_transitioning = True
+            self.home_page.set_adapter_controls_enabled(False)
+            # Give qfluentwidgets' SwitchButton animation time to finish before
+            # running heavier startup/teardown work on the UI thread.
+            QTimer.singleShot(280, lambda: self.home_page.set_engine_busy(True))
+            QTimer.singleShot(340, lambda state=checked: self._apply_engine_toggle(state))
 
-        def on_select_all_clicked(self):
-            self.table_widget.select_all()
-
-        def on_deselect_all_clicked(self):
-            self.table_widget.deselect_all()
-
-        # ========== 一键加速 / 停止（ProxyWorker 启停） ==========
-        def on_boost_clicked(self):
-            if self._is_boosting:
+        def _apply_engine_toggle(self, checked: bool):
+            # 任务3/4：虚拟网卡模式走 TUN 内核分支
+            if self._run_mode == "tun":
+                if checked and not self._tun_active:
+                    self._start_tun_mode()
+                elif not checked and self._tun_active:
+                    self._stop_tun_mode()
+                else:
+                    self._finish_engine_transition()
+                return
+            # 系统代理模式（既有逻辑，零改动）
+            if checked and not self._is_boosting:
+                self._start_proxy()
+            elif not checked and self._is_boosting:
                 self._stop_proxy()
             else:
-                self._start_proxy()
+                self._finish_engine_transition()
+
+        def _finish_engine_transition(self):
+            self._engine_transitioning = False
+            self.home_page.set_engine_busy(False)
+
+        # ========== 任务4：运行模式切换 + UAC 防御 ==========
+        def on_mode_changed(self, mode: str):
+            """用户切换运行模式。切到 tun 立即做管理员权限物理探针。"""
+            # 加速运行期间禁止切换内核模式；HomePage 已置灰，这里做防御式回滚。
+            if self._is_boosting or self._tun_active:
+                self.home_page.set_mode(self._run_mode)
+                return
+
+            if mode == "tun":
+                if not self._is_admin():
+                    # 未提权：弹高颜值纯文本 MessageBox，并安全回滚到代理模式
+                    box = MessageBox(
+                        tr("tun_need_admin_title"),
+                        tr("tun_need_admin_content"),
+                        self,
+                    )
+                    box.yesButton.setText(tr("mode_proxy"))
+                    box.cancelButton.hide()
+                    box.exec()
+                    self._run_mode = "proxy"
+                    self.home_page.set_mode("proxy")
+                    self.home_page.set_engine_state(False)
+                    self._persist_config()
+                    return
+            self._run_mode = mode
+            self._persist_config()
+            self.append_log(mw_tr(
+                "log_mode_changed",
+                mode=tr("mode_tun") if mode == "tun" else tr("mode_proxy"),
+            ))
+
+        @staticmethod
+        def _is_admin() -> bool:
+            """物理探针：是否以管理员权限运行。"""
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
+
+        # ========== 任务2：路由规则变更 ==========
+        def on_routing_rules_changed(self):
+            self._routing_rules = self.routing_page.get_rules()
+            self._persist_config()
+            # 若 TUN 正在运行，热重生成配置（下次重启内核生效）
+            if self._tun_active:
+                self._regenerate_singbox_config()
+
+        def _singbox_config_path(self):
+            # 固定写入 ~/.hypomux/singbox-config.json：该目录对当前用户始终可写，
+            # 且不依赖 __file__（onefile 打包态下 __file__ 会落到临时解包目录，
+            # 与 sys.executable 解析出的 bin 目录分叉）。sing-box 以绝对路径加载，
+            # 与工作目录无关。
+            config_dir = Path.home() / ".hypomux"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            return str(config_dir / "singbox-config.json")
+
+        def _regenerate_singbox_config(self) -> bool:
+            """据当前路由规则重新序列化 sing-box config.json。"""
+            try:
+                return singbox_config.generate_config_file(
+                    self._routing_rules,
+                    self._singbox_config_path(),
+                    app_process_path=self._app_process_paths(),
+                )
+            except Exception as e:
+                self.append_log(mw_tr("log_tun_config_failed", error=e))
+                return False
+
+        def _app_process_paths(self) -> List[str]:
+            """收集源码运行/Nuitka 打包运行时可能出现的宿主进程路径。"""
+            paths = []
+            for raw in (
+                sys.executable,
+                sys.argv[0] if sys.argv else "",
+                Path(sys.executable).with_name("HypoMux.exe"),
+                Path(sys.executable).with_name("main.exe"),
+                Path(sys.executable).with_name("python.exe"),
+            ):
+                try:
+                    path = str(Path(raw).resolve())
+                except Exception:
+                    path = str(raw).strip()
+                if path and path not in paths:
+                    paths.append(path)
+            return paths
+
+        # ========== 任务3：虚拟网卡（TUN）模式启停 ==========
+        def _start_tun_mode(self):
+            # 二次权限确认（防御式熔断）
+            if not self._is_admin():
+                box = MessageBox(
+                    tr("tun_need_admin_title"), tr("tun_need_admin_content"), self
+                )
+                box.cancelButton.hide()
+                box.exec()
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
+                return
+
+            foreign_tun = detect_foreign_tun_default_route()
+            if foreign_tun:
+                self.show_warning(tr("warn_foreign_tun_route", name=foreign_tun))
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
+                return
+
+            selected = self.get_selected_adapters()
+            if not selected:
+                self.show_warning(tr("warn_no_selection"))
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
+                return
+            self.append_log(mw_tr(
+                "log_tun_dns_plan",
+                paths=", ".join(self._app_process_paths()),
+            ))
+
+            # 1) 先拉起 Python 多端口出站池（2001/2002/2003）
+            try:
+                self._pool_worker = MultiPortProxyWorker(selected_nics=selected)
+                self._pool_worker.set_dns_servers([self._app_config.get("dns_server", "223.5.5.5")])
+                self._pool_worker.set_doh_provider(self._app_config.get("doh_provider", "auto"))
+                self._pool_worker.log_signal.connect(self.on_proxy_log)
+                self._pool_worker.traffic_signal.connect(self.on_proxy_traffic)
+                self._pool_worker.started_ok.connect(self._on_tun_pool_started)
+                self._pool_worker.error_signal.connect(self._on_tun_pool_error)
+                self._tun_starting = True
+                self.home_page.engine_switch.setEnabled(False)
+                self.home_page.set_adapter_controls_enabled(False)
+                self.routing_page.set_controls_enabled(False)
+                self.settings_page.set_controls_enabled(False)
+                self.tools_page.set_controls_enabled(False)
+                self._tun_pool_start_timer.start(5000)
+                self._pool_worker.start()
+            except Exception as e:
+                self._pool_worker = None
+                self._tun_starting = False
+                self.show_error(tr("error_start_failed", error=e))
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
+                return
+
+        def _on_tun_pool_started(self, info: str):
+            if not self._tun_starting or self._pool_worker is None:
+                return
+            self._tun_pool_start_timer.stop()
+            self.append_log(mw_tr("log_tun_pool_ready", info=info))
+
+            # 2) 生成 sing-box 配置
+            if not self._regenerate_singbox_config():
+                self._teardown_pool()
+                self._tun_starting = False
+                self._exit_boosting_ui()
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
+                return
+
+            # 3) 拉起 sing-box TUN 内核侧车
+            self.append_log(tr("tun_starting"))
+            self._tun_manager = TunManager(self._singbox_config_path())
+            self._tun_manager.log_signal.connect(self.on_proxy_log)
+            self._tun_manager.started_ok.connect(self._on_tun_started)
+            self._tun_manager.error_signal.connect(self._on_tun_error)
+            self._tun_manager.stopped.connect(self._on_tun_stopped)
+            self._tun_active = True
+            self.home_page.set_engine_state(True)
+            self.routing_page.set_controls_enabled(False)
+            self.settings_page.set_controls_enabled(False)
+            self.tools_page.set_controls_enabled(False)
+            self._tun_manager.start()
+
+        def _on_tun_pool_error(self, message: str):
+            if not self._tun_starting and not self._tun_active:
+                return
+            self._tun_pool_start_timer.stop()
+            message = localize_runtime_message(message)
+            self.append_log(mw_tr("log_tun_pool_failed", message=message))
+            self.show_error(message)
+            self._tun_starting = False
+            self._teardown_pool()
+            self._exit_boosting_ui()
+            self.home_page.set_engine_state(False)
+            self._finish_engine_transition()
+
+        def _on_tun_pool_start_timeout(self):
+            if not self._tun_starting or self._tun_active:
+                return
+            self.append_log(mw_tr("log_tun_pool_timeout"))
+            self.show_error(tr("tun_pool_start_timeout"))
+            self._tun_starting = False
+            self._teardown_pool()
+            self._exit_boosting_ui()
+            self.home_page.set_engine_state(False)
+            self._finish_engine_transition()
+
+        def _on_tun_started(self, info: str):
+            self._tun_starting = False
+            self._enter_boosting_ui()
+            self.home_page.set_engine_state(True)
+            self._finish_engine_transition()
+            self.show_success(tr("tun_started"))
+
+        def _on_tun_error(self, message: str):
+            message = localize_runtime_message(message)
+            self.append_log(f"[TUN] {message}")
+            self.show_error(message)
+            self._stop_tun_mode()
+
+        def _on_tun_stopped(self, message: str):
+            self.append_log(localize_runtime_message(message) or tr("tun_stopped"))
+
+        def _teardown_pool(self):
+            if self._pool_worker is not None:
+                try:
+                    self._pool_worker.stop()
+                    if self._pool_worker.isRunning():
+                        self._pool_worker.wait(3000)
+                except Exception:
+                    pass
+                self._pool_worker = None
+
+        def _stop_tun_mode(self):
+            try:
+                self._tun_pool_start_timer.stop()
+            except Exception:
+                pass
+            # 1) 杀 sing-box 内核 + 清路由
+            if self._tun_manager is not None:
+                try:
+                    self._tun_manager.stop()
+                    if self._tun_manager.isRunning():
+                        self._tun_manager.wait(6000)
+                    # 兜底强杀，杜绝残留导致断网
+                    self._tun_manager.force_kill()
+                except Exception:
+                    pass
+                self._tun_manager = None
+            # 2) 关 Python 出站池
+            self._teardown_pool()
+            self._tun_active = False
+            self._tun_starting = False
+            self._exit_boosting_ui()
+            self.home_page.set_engine_state(False)
+            self._finish_engine_transition()
 
         def _start_proxy(self):
-            selected = self.table_widget.get_selected_adapters()
+            selected = self.get_selected_adapters()
             if not selected:
-                self.show_warning(mw_tr("warn_no_selection"))
+                self.show_warning(tr("warn_no_selection"))
+                # 回滚开关
+                self.home_page.set_engine_state(False)
+                self._finish_engine_transition()
                 return
             if self.proxy_worker is not None:
+                self._finish_engine_transition()
                 return
 
             if get_steam_pids():
-                self.show_warning(mw_tr("warn_steam_running"))
+                self.show_warning(tr("warn_steam_running"))
                 self.append_log(mw_tr("log_steam_running"))
 
-            socks_port = self.port_spinbox.value()
+            socks_port = int(self._app_config.get("socks_port", DEFAULT_SOCKS_PORT))
             http_port = socks_port + 1
             self._pending_socks_addr = f"127.0.0.1:{socks_port}"
             self._pending_http_addr = f"127.0.0.1:{http_port}"
@@ -1129,142 +1096,117 @@ def create_main_window():
 
                 self._is_boosting = True
                 self._enter_boosting_ui()
-                nic_names = ", ".join(n['name'] for n in selected)
+                nic_names = ", ".join(n["name"] for n in selected)
                 self.append_log(mw_tr(
-                    "log_starting",
-                    socks=self._pending_socks_addr,
-                    http=self._pending_http_addr,
-                    nics=nic_names,
+                    "log_starting", socks=self._pending_socks_addr,
+                    http=self._pending_http_addr, nics=nic_names,
                 ))
-                self._set_status("status_starting")
+                self.home_page.set_engine_state(True, socks_port, http_port)
                 self.proxy_worker.start()
             except Exception as e:
                 try:
                     set_system_proxy(False)
-                except Exception as cleanup_error:
-                    self.append_log(mw_tr("log_start_cleanup_error", error=cleanup_error))
+                except Exception as ce:
+                    self.append_log(mw_tr("log_start_cleanup_error", error=ce))
                 self.proxy_worker = None
                 self._is_boosting = False
                 self._exit_boosting_ui()
                 self.append_log(mw_tr("log_start_exception", error=e))
-                self.show_error(mw_tr("error_start_failed", error=e))
+                self.show_error(tr("error_start_failed", error=e))
+                self._finish_engine_transition()
 
         def _stop_proxy(self):
             try:
                 if self.proxy_worker is None:
                     self._is_boosting = False
                     self._exit_boosting_ui()
+                    self._finish_engine_transition()
                     return
                 self.append_log(mw_tr("log_stop_requested"))
-                self._set_status("status_stopping")
-                self.boost_btn.setEnabled(False)  # 停止完成（on_proxy_stopped）后再恢复
-
-                # ===== 退出生命周期：严格按序，根治"停止加速后 Steam 离线"=====
-                # 步骤 1+2：先把注册表 ProxyEnable 置 0，并立即调用 WinINet
-                #          InternetSetOption(SETTINGS_CHANGED + REFRESH) 强刷全局网络栈缓存。
-                #          set_system_proxy(False) 内部已完成这两步。
+                self.home_page.set_controls_enabled(False)
                 set_system_proxy(False)
                 self.append_log(mw_tr("log_proxy_disabled"))
-
-                # 步骤 3：短暂保留本地监听，给 Steam 的重连与 WinINet 刷新留出窗口。
-                # 步骤 4：延时结束后再彻底关闭本地 Socket 监听、释放端口。
                 QTimer.singleShot(300, self._finish_stop_proxy)
             except Exception:
-                # 兜底：即便上面异常，也要确保监听被叫停
                 self._finish_stop_proxy()
 
         def _finish_stop_proxy(self):
-            """退出生命周期步骤 4：延时结束后安全关闭本地 Socket 监听服务。"""
             if self.proxy_worker is None:
                 return
-            # ProxyWorker.stop() 内部用 loop.call_soon_threadsafe 安全叫停子线程的 asyncio loop
             self.proxy_worker.stop()
             self._stop_fallback_timer.start(6000)
 
         def _enter_boosting_ui(self):
-            self.boost_btn.setText(mw_tr("boost_stop"))
-            self._apply_boost_button_style(active=True)
-            self.select_all_btn.setEnabled(False)
-            self.deselect_all_btn.setEnabled(False)
-            self.refresh_btn.setEnabled(False)
-            self.port_spinbox.setEnabled(False)
-            self.table_widget.set_checkboxes_enabled(False)
+            self.home_page.set_controls_enabled(False)
+            self.routing_page.set_controls_enabled(False)
+            self.settings_page.set_controls_enabled(False)
+            self.tools_page.set_controls_enabled(False)
 
         def _exit_boosting_ui(self):
-            self.boost_btn.setText(mw_tr("boost_start"))
-            self._apply_boost_button_style(active=False)
-            self.boost_btn.setEnabled(True)
-            self.select_all_btn.setEnabled(True)
-            self.deselect_all_btn.setEnabled(True)
-            self.refresh_btn.setEnabled(True)
-            self.port_spinbox.setEnabled(True)
-            self.table_widget.set_checkboxes_enabled(True)
-            self.table_widget.reset_traffic()
-            self.speed_value_label.setText("0.00")
+            self.home_page.engine_switch.setEnabled(True)
+            self.home_page.set_engine_state(False)
+            self.home_page.set_controls_enabled(True)
+            self.routing_page.set_controls_enabled(True)
+            self.settings_page.set_controls_enabled(True)
+            self.tools_page.set_controls_enabled(True)
+            self.home_page.reset_telemetry()
             self._last_up_mbps = 0.0
             self._last_conn_count = 0
-            self.up_value_label.setText(mw_tr("up_format", value=0.0))
-            self.conn_value_label.setText(mw_tr("conn_format", value=0))
 
+        # ========== ProxyWorker 信号 ==========
         @Slot(str)
         def on_proxy_log(self, message: str):
             self.append_log(message)
 
         @Slot(dict)
         def on_proxy_traffic(self, payload: dict):
-            # 点亮数据大屏：合并下行总速度 + 上行 + 总连接数
             total = payload.get("_total", {})
-            down = total.get('down_mbps', 0.0)
-            up = total.get('up_mbps', 0.0)
-            conn = total.get('connections', 0)
+            down = total.get("down_mbps", 0.0)
+            up = total.get("up_mbps", 0.0)
+            conn = total.get("connections", 0)
             self._last_up_mbps = up
             self._last_conn_count = conn
-            self.speed_value_label.setText(f"{down:.2f}")
-            self.up_value_label.setText(mw_tr("up_format", value=up))
-            self.conn_value_label.setText(mw_tr("conn_format", value=conn))
-            self._set_status("status_running_live", down=down, conn=conn)
-            # 各网卡实时速度和连接数回填到表格
-            self.table_widget.update_traffic(payload)
+            self.home_page.update_total(down, up, conn)
+            self.home_page.update_telemetry(payload)
 
         @Slot(str)
         def on_proxy_started(self, endpoint: str):
             try:
                 set_system_proxy(True, self._pending_socks_addr, self._pending_http_addr)
                 self.append_log(mw_tr(
-                    "log_proxy_enabled",
-                    http=self._pending_http_addr,
+                    "log_proxy_enabled", http=self._pending_http_addr,
                     socks=self._pending_socks_addr,
                 ))
             except Exception as e:
                 self.append_log(mw_tr("log_proxy_enable_failed", error=e))
-                self.show_error(mw_tr("error_proxy_write", error=e))
+                self.show_error(tr("error_proxy_write", error=e))
                 if self.proxy_worker is not None:
                     self.proxy_worker.stop()
+                self._finish_engine_transition()
                 return
-
             self._is_boosting = True
-            self.boost_btn.setEnabled(True)
-            self._set_status("status_running", endpoint=endpoint)
+            self.home_page.engine_switch.setEnabled(True)
+            self._finish_engine_transition()
             self.show_success(mw_tr(
-                "proxy_started_success",
-                http=self._pending_http_addr,
+                "proxy_started_success", http=self._pending_http_addr,
                 socks=self._pending_socks_addr,
             ))
 
         @Slot(str)
         def on_proxy_error(self, message: str):
+            message = localize_runtime_message(message)
             self.append_log(mw_tr("log_error", message=message))
-            self._set_status("status_start_failed")
             try:
                 set_system_proxy(False)
                 self.append_log(mw_tr("log_start_failed_cleanup"))
             except Exception as e:
                 self.append_log(mw_tr("log_start_cleanup_error", error=e))
             self.show_error(message)
-            # 启动失败后内核会走 stopped 流程收尾，这里只提示
+            self._finish_engine_transition()
 
         @Slot(str)
         def on_proxy_stopped(self, message: str):
+            message = localize_runtime_message(message)
             self._stop_fallback_timer.stop()
             self.append_log(mw_tr("log_stopped", message=message))
             try:
@@ -1272,9 +1214,8 @@ def create_main_window():
             except Exception as e:
                 self.append_log(mw_tr("log_stop_cleanup_error", error=e))
             self._is_boosting = False
-            self._set_status("status_stopped")
             self._exit_boosting_ui()
-            # 等待子线程完全结束并释放引用，便于下次重新启动
+            self._finish_engine_transition()
             if self.proxy_worker is not None:
                 if self.proxy_worker.isRunning():
                     self.proxy_worker.wait(3000)
@@ -1283,17 +1224,15 @@ def create_main_window():
         def _force_finish_stop_ui(self):
             if self.proxy_worker is None or not self._is_boosting:
                 return
-
             worker = self.proxy_worker
             self.append_log(mw_tr("log_stop_fallback"))
             try:
                 set_system_proxy(False)
             except Exception as e:
                 self.append_log(mw_tr("log_stop_fallback_error", error=e))
-
             self._is_boosting = False
-            self._set_status("status_stopped")
             self._exit_boosting_ui()
+            self._finish_engine_transition()
             self.proxy_worker = None
             try:
                 worker.stopped.disconnect(self.on_proxy_stopped)
@@ -1308,69 +1247,174 @@ def create_main_window():
             except ValueError:
                 pass
 
-        def closeEvent(self, event):
-            """退出清理：根据用户设置决定最小化到托盘或彻底退出。"""
-            settings = QSettings("Hypostasis-Cat", "HypoMux")
-            close_behavior = settings.value("close_behavior", "tray", type=str)
-
-            # 如果设置为最小化到托盘，则隐藏窗口而不真正退出
-            if close_behavior == "tray":
-                event.ignore()  # 阻止默认关闭行为
-                self.hide()     # 隐藏主窗口
-                # 可选：首次最小化时提示用户
-                if not hasattr(self, '_tray_tip_shown'):
-                    self.tray_icon.showMessage(
-                        "HypoMux",
-                        mw_tr("tray_tooltip"),
-                        QSystemTrayIcon.Information,
-                        2000
-                    )
-                    self._tray_tip_shown = True
+        # ========== 网卡体检（第二阶段诊断）==========
+        def on_diagnose_clicked(self):
+            if self.diag_worker is not None and self.diag_worker.isRunning():
                 return
+            selected = self.get_selected_adapters()
+            if not selected:
+                self.show_warning(tr("diag_no_selection"))
+                return
+            self.tools_page.begin_running()
+            self.append_log(mw_tr("log_starting", socks="-", http="-",
+                                  nics=", ".join(n["name"] for n in selected))
+                            if False else tr("diag_running",
+                                             name=", ".join(n["name"] for n in selected)))
+            self.diag_worker = DiagnosticWorker(selected, DEFAULT_TARGET_IP)
+            self.diag_worker.result_ready.connect(self.on_diag_result)
+            self.diag_worker.all_finished.connect(self.on_diag_finished)
+            self.diag_worker.diag_error.connect(self.on_diag_error)
+            self.diag_worker.start()
 
-            # 否则执行彻底退出
+        @Slot(dict)
+        def on_diag_result(self, result: dict):
+            self.tools_page.add_result(result)
+            # 同步首页对应卡片的健康徽标
+            self.home_page.update_health(result.get("name", ""), result.get("status", "unavailable"))
+            status = result.get("status", "unavailable")
+            name = result.get("name", "")
+            self.append_log(mw_tr(
+                "log_diag_result",
+                name=name,
+                status=tr("diag_status_" + status),
+                loss_label=tr("diag_metric_loss"),
+                loss=result.get("loss_rate", 0),
+                jitter_label=tr("diag_metric_jitter"),
+                jitter=result.get("jitter_ms", 0),
+            ))
+
+        @Slot()
+        def on_diag_finished(self):
+            self.tools_page.end_running()
+            if self.diag_worker is not None:
+                if self.diag_worker.isRunning():
+                    self.diag_worker.wait(2000)
+                self.diag_worker = None
+
+        @Slot(str)
+        def on_diag_error(self, message: str):
+            self.tools_page.end_running()
+            self.show_error(localize_runtime_message(message))
+            self.diag_worker = None
+
+        # ========== 日志 ==========
+        def append_log(self, message: str):
+            APP_LOGGER.info(str(message))
+
+        # ========== 退出清理 ==========
+        def shutdown_backend_workers(self):
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
             try:
+                self._persist_config()
+            except Exception:
+                pass
+            try:
+                self._stop_fallback_timer.stop()
+            except Exception:
+                pass
+            try:
+                self._tun_pool_start_timer.stop()
+            except Exception:
+                pass
+            try:
+                if self._tun_active or self._tun_manager is not None:
+                    self._stop_tun_mode()
+                elif self._pool_worker is not None:
+                    self._teardown_pool()
+
                 if self.proxy_worker is not None:
                     self.proxy_worker.stop()
                     if self.proxy_worker.isRunning():
-                        self.proxy_worker.wait(3000)
+                        self.proxy_worker.wait(6000)
                     self.proxy_worker = None
-                if self.scan_worker.isRunning():
-                    self.scan_worker.wait(3000)
-            except Exception as e:
-                print(mw_tr("log_close_cleanup_error", error=e))
-            finally:
+                    self._is_boosting = False
+
+                for worker in list(self._retired_proxy_workers):
+                    try:
+                        worker.stop()
+                        if worker.isRunning():
+                            worker.wait(3000)
+                    except Exception:
+                        pass
+                self._retired_proxy_workers.clear()
+
                 try:
                     set_system_proxy(False)
                 except Exception as e:
                     print(mw_tr("log_close_proxy_error", error=e))
-                # 清理系统托盘图标
-                if hasattr(self, 'tray_icon'):
+
+                if self.scan_worker.isRunning():
+                    self.scan_worker.wait(3000)
+                if self.diag_worker is not None and self.diag_worker.isRunning():
+                    self.diag_worker.wait(3000)
+            except Exception as e:
+                print(mw_tr("log_close_cleanup_error", error=e))
+            finally:
+                try:
+                    startupinfo = None
+                    if hasattr(subprocess, "STARTUPINFO"):
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = 0
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "sing-box.exe", "/T"],
+                        capture_output=True,
+                        timeout=5,
+                        startupinfo=startupinfo,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                    )
+                except Exception:
+                    pass
+
+        def closeEvent(self, event):
+            settings = QSettings("Hypostasis-Cat", "HypoMux")
+            close_behavior = settings.value("close_behavior", "tray", type=str)
+
+            # 关闭前持久化配置
+            self._persist_config()
+
+            if close_behavior == "tray" and not self._force_exit:
+                event.ignore()
+                self.hide()
+                if not hasattr(self, "_tray_tip_shown"):
+                    self.tray_icon.showMessage(
+                        "HypoMux", tr("tray_tooltip"),
+                        QSystemTrayIcon.Information, 2000
+                    )
+                    self._tray_tip_shown = True
+                return
+
+            try:
+                self.shutdown_backend_workers()
+            finally:
+                if hasattr(self, "tray_icon"):
                     self.tray_icon.hide()
-            super().closeEvent(event)
+                event.accept()
 
         # ========== InfoBar 提示 ==========
         def show_info(self, message: str):
             self._InfoBar.info(
-                title=mw_tr("infobar_info"), content=message, orient=self._Qt.Horizontal,
+                title=tr("infobar_info"), content=message, orient=self._Qt.Horizontal,
                 position=self._InfoBarPosition.TOP_RIGHT, duration=2000, parent=self
             )
 
         def show_success(self, message: str):
             self._InfoBar.success(
-                title=mw_tr("infobar_success"), content=message, orient=self._Qt.Horizontal,
+                title=tr("infobar_success"), content=message, orient=self._Qt.Horizontal,
                 position=self._InfoBarPosition.TOP_RIGHT, duration=2200, parent=self
             )
 
         def show_warning(self, message: str):
             self._InfoBar.warning(
-                title=mw_tr("infobar_warning"), content=message, orient=self._Qt.Horizontal,
+                title=tr("infobar_warning"), content=message, orient=self._Qt.Horizontal,
                 position=self._InfoBarPosition.TOP_RIGHT, duration=2200, parent=self
             )
 
         def show_error(self, message: str):
             self._InfoBar.error(
-                title=mw_tr("infobar_error"), content=message, orient=self._Qt.Horizontal,
+                title=tr("infobar_error"), content=message, orient=self._Qt.Horizontal,
                 position=self._InfoBarPosition.TOP_RIGHT, duration=3000, parent=self
             )
 

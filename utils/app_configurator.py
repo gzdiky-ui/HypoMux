@@ -42,9 +42,9 @@ class AppConfigurator:
         # 方法 1：尝试修改 Steam 注册表配置
         registry_success = self._configure_steam_registry()
         if registry_success:
-            messages.append("✓ 已配置 Steam 注册表代理设置")
+            messages.append("OK 已配置 Steam 注册表代理设置")
         else:
-            messages.append("⚠ 未找到 Steam 注册表配置（可能未安装 Steam）")
+            messages.append(" 未找到 Steam 注册表配置（可能未安装 Steam）")
 
         # 方法 2：创建桌面快捷方式（作为备选方案）
         try:
@@ -81,14 +81,14 @@ $Shortcut.Save()
             if result.returncode == 0:
                 messages.append("OK 已在桌面创建快捷方式: Steam (HypoMux 加速).lnk")
             else:
-                messages.append(f"⚠ 创建快捷方式失败: {result.stderr}")
+                messages.append(f" 创建快捷方式失败: {result.stderr}")
 
         except Exception as e:
-            messages.append(f"⚠ 创建快捷方式失败: {str(e)}")
+            messages.append(f" 创建快捷方式失败: {str(e)}")
 
         # 组合返回消息
         success_msg = "\n".join(messages)
-        success_msg += f"\n\n📌 重要提示：\n"
+        success_msg += f"\n\n 重要提示：\n"
         success_msg += f"1. 完全关闭 Steam（右键托盘图标 → 退出）\n"
         success_msg += f"2. 确保 HypoMux 已启动加速（端口 {self.proxy_port}）\n"
 
@@ -166,7 +166,7 @@ $Shortcut.Save()
             ) as key:
                 try:
                     winreg.DeleteValue(key, "Socks5Proxy")
-                    messages.append("✓ 已删除 Steam 注册表代理配置")
+                    messages.append("OK 已删除 Steam 注册表代理配置")
                 except FileNotFoundError:
                     pass
 
@@ -176,7 +176,7 @@ $Shortcut.Save()
                     pass
 
         except Exception as e:
-            messages.append(f"⚠ 清理注册表失败: {str(e)}")
+            messages.append(f" 清理注册表失败: {str(e)}")
 
         # 删除快捷方式
         try:
@@ -185,9 +185,9 @@ $Shortcut.Save()
 
             if shortcut_path.exists():
                 shortcut_path.unlink()
-                messages.append("✓ 已删除 Steam 加速快捷方式")
+                messages.append("OK 已删除 Steam 加速快捷方式")
         except Exception as e:
-            messages.append(f"⚠ 删除快捷方式失败: {str(e)}")
+            messages.append(f" 删除快捷方式失败: {str(e)}")
 
         if not messages:
             return True, "Steam 代理配置不存在，无需恢复"
@@ -381,7 +381,7 @@ $Shortcut.Save()
             if auto_mode:
                 return True, f"系统代理已配置: {proxy_value}"
             else:
-                return True, f"✅ Windows 系统代理已设置为 SOCKS5 模式\n\n代理地址: {proxy_value}\n\n支持的应用：\n• Chrome/Edge/Firefox 浏览器\n• Steam 游戏平台\n• IDM 下载器\n• 迅雷、百度网盘\n\n⚠️ 部分老旧应用可能不支持，请使用专用配置功能。"
+                return True, f" Windows 系统代理已设置为 SOCKS5 模式\n\n代理地址: {proxy_value}\n\n支持的应用：\n• Chrome/Edge/Firefox 浏览器\n• Steam 游戏平台\n• IDM 下载器\n• 迅雷、百度网盘\n\n️ 部分老旧应用可能不支持，请使用专用配置功能。"
 
         except Exception as e:
             return False, f"配置失败: {str(e)}"
