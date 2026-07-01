@@ -192,12 +192,12 @@ HypoMux 是一个完全出于技术热情、由作者在业余时间独立开发
       <td align="center" width="320">
         <img src="support/wei.png" alt="微信赞赏码" width="260" />
         <br />
-        <sub>微信赞赏（请备注：HypoMux 支持）</sub>
+        <sub>微信赞赏（请备注您的昵称，未备注则表示匿名）</sub>
       </td>
       <td align="center" width="320">
         <img src="support/zhi.jpg" alt="支付宝赞赏码" width="260" />
         <br />
-        <sub>支付宝赞赏（请备注：HypoMux 支持）</sub>
+        <sub>支付宝赞赏（请备注您的昵称，未备注则表示匿名）</sub>
       </td>
     </tr>
   </table>
